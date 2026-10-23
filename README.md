@@ -16,4 +16,4 @@ python main.py
 ## Use
 1. Bot ko channel/group me admin banao (Invite Users permission).
 2. Bot me /settings dabao -> sab kuch buttons se.
-3. Old requests: gen_session.py se SESSION_STRING lo, wo account bhi chat me admin ho. Chat -> "Approve Old Requests".
+3. Old requests: bot me Settings -> "Old-Req Session" -> Login (phone+OTP). Session MongoDB me save hota hai (Render me kuch nahi badalna). Wo account chat me admin ho. Phir Chat -> "Approve Old Requests".

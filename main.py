@@ -2,7 +2,8 @@ import os, asyncio, random, logging, functools
 from aiohttp import web, ClientSession
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters
-from pyrogram.errors import FloodWait, RPCError, MessageNotModified
+from pyrogram.errors import (FloodWait, RPCError, MessageNotModified, SessionPasswordNeeded,
+                             PhoneCodeInvalid, PhoneCodeExpired)
 from pyrogram.types import (ChatJoinRequest, Message, CallbackQuery,
                             InlineKeyboardMarkup, InlineKeyboardButton as B)
 
@@ -25,11 +26,11 @@ PAGE = 8
 
 db = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)["joinbot"]
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
-user = Client("user", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING,
-              in_memory=True) if SESSION_STRING else None
+user = None  # bot ke andar login karne par set hota hai (ya SESSION_STRING env se)
 
 queue: asyncio.Queue = asyncio.Queue()
 old_tasks: dict[int, asyncio.Task] = {}
+logins: dict[int, dict] = {}
 pending: dict[int, tuple] = {}   # owner_id -> ("add",) / ("delay",) / ("cdelay", cid) / ("welcome",)
 
 DEFAULTS = {"active": True, "auto_all": True, "min": 2, "max": 15, "welcome_on": False,
@@ -121,6 +122,12 @@ async def approve_old(cid: int, notify: int):
     lo, hi = c.get("min", g["min"]), c.get("max", g["max"])
     done = fail = 0
     try:
+        try:
+            await user.get_chat(cid)
+        except Exception:
+            async for _ in user.get_dialogs():  # peer cache bharo
+                pass
+            await user.get_chat(cid)
         async for req in user.get_chat_join_requests(cid):
             try:
                 await user.approve_chat_join_request(cid, req.user.id)
@@ -163,7 +170,8 @@ async def main_panel():
         [B(f"Auto-all chats {tick(g['auto_all'])}", callback_data="g:auto_all")],
         [B(f"Welcome DM {tick(g['welcome_on'])}", callback_data="g:welcome_on")],
         [B("📺 Chats", callback_data="chats"), B("⏱ Delay", callback_data="delay")],
-        [B("👋 Welcome Text", callback_data="wt"), B("🔄 Refresh", callback_data="main")]])
+        [B("👋 Welcome Text", callback_data="wt"), B("🔑 Old-Req Session", callback_data="ses")],
+        [B("🔄 Refresh", callback_data="main")]])
     return text, kb
 
 async def chats_panel(page=0):
@@ -207,13 +215,83 @@ async def delay_panel():
     return f"**⏱ Global Delay**\nAbhi: {g['min']}-{g['max']}s", kb
 
 
+# ---------------- session login (bot ke andar) ----------------
+async def stop_user():
+    global user
+    for t in list(old_tasks.values()):
+        t.cancel()
+    if user:
+        try:
+            await user.stop()
+        except Exception:
+            pass
+    user = None
+
+async def start_user(sess: str):
+    global user
+    await stop_user()
+    c = Client("user", api_id=API_ID, api_hash=API_HASH, session_string=sess, in_memory=True)
+    await c.start()
+    user = c
+
+async def load_user():
+    doc = await db.settings.find_one({"_id": "session"})
+    sess = (doc or {}).get("string") or SESSION_STRING
+    if sess:
+        await start_user(sess)
+
+async def cancel_login(uid: int):
+    pending.pop(uid, None)
+    lg = logins.pop(uid, None)
+    if lg:
+        try:
+            await lg["c"].disconnect()
+        except Exception:
+            pass
+
+async def try_delete(m: Message):
+    try:
+        await m.delete()
+    except Exception:
+        pass
+
+async def finish_login(m: Message, uid: int):
+    lg = logins.pop(uid)
+    sess = await lg["c"].export_session_string()
+    await lg["c"].disconnect()
+    pending.pop(uid, None)
+    await db.settings.update_one({"_id": "session"}, {"$set": {"string": sess}}, upsert=True)
+    await start_user(sess)
+    await m.reply("✅ Login ho gaya! Session save ho gaya, ab Render me kuch badalna nahi hai.")
+    await show(m, *await session_panel())
+
+async def session_panel():
+    if user:
+        try:
+            me = await user.get_me()
+            who = f"{me.first_name} (`{me.id}`)"
+        except Exception:
+            who = "(info nahi mili)"
+        text = (f"**🔑 Old-Request Session**\n\nLogged in: {who} ✅\n\n"
+                "Ye account us channel/group me **admin** hona chahiye (Invite Users permission).")
+        rows = [[B("🚪 Logout / Remove", callback_data="lo")], [B("🔙 Back", callback_data="main")]]
+    else:
+        text = ("**🔑 Old-Request Session**\n\nAbhi koi session nahi hai ❌\n"
+                "Purani pending requests approve karne ke liye ek user account login karo "
+                "(better: alag/secondary account).")
+        rows = [[B("📲 Login (Phone + OTP)", callback_data="lg")],
+                [B("📋 Paste Session String", callback_data="ls")],
+                [B("🔙 Back", callback_data="main")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
 # ---------------- commands ----------------
 @bot.on_message(filters.command(["start", "settings", "help"]) & filters.private)
 @safe
 async def start(_, m: Message):
     if m.from_user.id not in OWNERS:
         return await m.reply(f"Main ek auto join-request bot hoon.\nAapki ID: `{m.from_user.id}`")
-    pending.pop(m.from_user.id, None)
+    await cancel_login(m.from_user.id)
     await show(m, *await main_panel())
 
 
@@ -261,14 +339,14 @@ async def cb(_, q: CallbackQuery):
     uid = q.from_user.id
     try:
         if act == "main":
-            pending.pop(uid, None)
+            await cancel_login(uid)
             return await show(q, *await main_panel())
         if act == "g":
             g = await gcfg()
             await gset(**{arg: not g[arg]})
             return await show(q, *await main_panel())
         if act == "chats":
-            pending.pop(uid, None)
+            await cancel_login(uid)
             return await show(q, *await chats_panel())
         if act == "p":
             return await show(q, *await chats_panel(int(arg)))
@@ -308,6 +386,20 @@ async def cb(_, q: CallbackQuery):
             pending[uid] = ("add",)
             return await q.message.reply("Chat ID bhejo (`-100...`), @username, ya channel/group ka koi message forward karo.\n"
                                          "Bot us chat me admin hona chahiye.")
+        if act == "ses":
+            return await show(q, *await session_panel())
+        if act == "lg":
+            await cancel_login(uid)
+            pending[uid] = ("lphone",)
+            return await q.message.reply("📲 Account ka phone number bhejo country code ke saath, jaise `+919876543210`")
+        if act == "ls":
+            pending[uid] = ("lstr",)
+            return await q.message.reply("📋 Pyrogram SESSION_STRING paste karo (message turant delete kar diya jayega).")
+        if act == "lo":
+            await stop_user()
+            await db.settings.delete_one({"_id": "session"})
+            await q.answer("Logout ho gaya")
+            return await show(q, *await session_panel())
         if act == "delay":
             return await show(q, *await delay_panel())
         if act == "dp":
@@ -337,7 +429,44 @@ async def on_input(_, m: Message):
     if not state:
         return
     kind = state[0]
+    uid = m.from_user.id
     try:
+        if kind == "lphone":
+            phone = m.text.strip().replace(" ", "")
+            tmp = Client(f"login{uid}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
+            await tmp.connect()
+            try:
+                sent = await tmp.send_code(phone)
+            except Exception:
+                await tmp.disconnect()
+                raise
+            logins[uid] = {"c": tmp, "phone": phone, "hash": sent.phone_code_hash}
+            pending[uid] = ("lcode",)
+            return await m.reply("📨 Telegram ne us account me OTP bheja hai.\n\n"
+                                 "Code **spaces ke saath** bhejo, jaise `1 2 3 4 5` "
+                                 "(seedha bhejoge to Telegram code block kar deta hai).")
+        if kind == "lcode":
+            lg = logins[uid]
+            code = "".join(ch for ch in m.text if ch.isdigit())
+            await try_delete(m)
+            try:
+                await lg["c"].sign_in(lg["phone"], lg["hash"], code)
+            except SessionPasswordNeeded:
+                pending[uid] = ("lpass",)
+                return await m.reply("🔐 2-step verification password bhejo (message delete ho jayega).")
+            return await finish_login(m, uid)
+        if kind == "lpass":
+            lg = logins[uid]
+            await try_delete(m)
+            await lg["c"].check_password(m.text)
+            return await finish_login(m, uid)
+        if kind == "lstr":
+            await try_delete(m)
+            await start_user(m.text.strip())
+            await db.settings.update_one({"_id": "session"}, {"$set": {"string": m.text.strip()}}, upsert=True)
+            pending.pop(uid, None)
+            await m.reply("✅ Session set ho gaya.")
+            return await show(m, *await session_panel())
         if kind == "add":
             fo = getattr(m, "forward_from_chat", None) or getattr(getattr(m, "forward_origin", None), "chat", None)
             ref = fo.id if fo else (m.text or "").strip()
@@ -362,6 +491,9 @@ async def on_input(_, m: Message):
             await m.reply("✅ Welcome text save + ON")
             return await show(m, *await main_panel())
     except Exception as e:
+        if kind == "lphone" or isinstance(e, PhoneCodeExpired) or kind == "lstr":
+            await cancel_login(uid)
+            return await m.reply(f"❌ {type(e).__name__}: {str(e)[:500]}\nPhir se Login button dabao.")
         await m.reply(f"❌ {type(e).__name__}: {str(e)[:500]}\nDobara bhejo ya /settings dabao.")
 
 
@@ -388,8 +520,10 @@ async def self_ping():
 async def main():
     await web_app()
     await bot.start()
-    if user:
-        await user.start()
+    try:
+        await load_user()
+    except Exception as e:
+        log.warning('session load fail: %s', e)
     for _ in range(WORKERS):
         asyncio.create_task(worker())
     asyncio.create_task(self_ping())
