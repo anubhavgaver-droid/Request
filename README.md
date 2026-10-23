@@ -1,28 +1,32 @@
 # Telegram Auto Join Request Bot
 
-Channel + group join requests auto-approve (human-like delay), purani requests approve (helper account se),
-failed requests ka reason-wise report, aur Public/Private mode.
+Auto-approve (human-like delay), purani requests (helper account), Failed Report, Public/Private mode,
+Free/Premium plans, Hindi/English, Captcha, Force Subscribe, Log channel + alerts, User ban.
 
 ## Render (Web Service)
-- Build: `pip install -r requirements.txt`
-- Start: `python main.py`
+- Build: `pip install -r requirements.txt`   Start: `python main.py`
 - Env vars: .env.example ke hisaab se (+ `PYTHON_VERSION=3.11.9` recommended)
-- PORT aur RENDER_EXTERNAL_URL Render khud deta hai (self-ping har 5 min)
 - MongoDB Atlas: Network Access me 0.0.0.0/0 allow karo
 
-## Admin (OWNER_IDS)
-- /settings -> poora panel (Active, Auto-all, Delay, Welcome, Old-Req Session, Public/Private)
-- /public aur /private -> bot sabke liye khule ya sirf admin ke liye
-- /users -> bot start karne wale sabhi users ki list (10 per page, Next/Back): naam, @username, ID, start/last time, chats, approved
-- Old-Req Session -> helper account login (phone + OTP). Sirf admin ko dikhta hai.
+## Admin commands (OWNER_IDS)
+/settings  panel | /public /private  mode | /users  users list (10/page)
+/premium <id> <days>   Premium do (days jodte jate hain) | /free <id>  Premium hatao | /premiums  list
+/ban <id>  /unban <id>  /banned  list
+Panel: Log Channel (set/test/remove), Old-Req Session (helper login), Users -> Ban/Premium buttons
 
-## Users (Public mode)
-1. Bot ko apne chat me admin banao (Invite Users permission) -> chat auto-add
-2. Ya /start -> Add Chat
-3. Chat ki settings: approve ON/OFF, delay, welcome DM, failed report
-4. Purani requests: bot helper account ki details dikhata hai, use chat me admin banao,
-   phir chat -> Approve Old Requests
+## Plans
+Free: FREE_CHATS chats, auto approve, delay, welcome DM, failed report
+Premium: PREMIUM_CHATS chats + Captcha (human button / math) + Force Subscribe + old requests approve
+Premium khatam hote hi captcha/force-sub apne-aap band ho jate hain, user ko DM jata hai.
 
-## Failed Report
-Chat -> Failed Report: reason-wise ginti (500 limit, deleted account, already member, banned, ...),
-recent users, aur kisi ek user ki ID se reason check.
+## Captcha / Force Subscribe (Premium)
+Chat -> Captcha button cycles Off -> Human -> Math. Force Subscribe: max 3 channels (bot unme admin ho).
+User ko request ke baad bot DM karta hai; GATE_MINUTES me verify/join na kare to request decline.
+Failed ones Failed Report me dikhte hain.
+
+## Log channel / alerts
+Naye users, naye chats, premium/ban changes, errors, bot hataye jaane par, helper session mar jaane par.
+Log channel set nahi to important alerts owners ko DM aate hain.
+
+## Helper account (old requests)
+Settings -> Old-Req Session -> Login (phone + OTP). Secondary account use karo, chat me admin banao.
