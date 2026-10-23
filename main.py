@@ -1,4 +1,4 @@
-import os, asyncio, random, logging
+import os, asyncio, random, logging, functools
 from aiohttp import web, ClientSession
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters
@@ -20,7 +20,7 @@ SELF_URL = os.environ.get("RENDER_EXTERNAL_URL")
 WORKERS = int(os.environ.get("WORKERS", 3))
 PAGE = 8
 
-db = AsyncIOMotorClient(MONGO_URI)["joinbot"]
+db = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)["joinbot"]
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 user = Client("user", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING,
               in_memory=True) if SESSION_STRING else None
@@ -60,6 +60,21 @@ async def effective(cid: int):
 
 is_owner = filters.create(lambda _, __, m: bool(m.from_user) and m.from_user.id in OWNERS)
 
+
+
+def safe(fn):
+    @functools.wraps(fn)
+    async def w(client, update, *a, **k):
+        try:
+            return await fn(client, update, *a, **k)
+        except Exception as e:
+            log.exception("handler error in %s", fn.__name__)
+            target = update.message if isinstance(update, CallbackQuery) else update
+            try:
+                await target.reply(f"❌ **Error** (`{fn.__name__}`)\n`{type(e).__name__}: {str(e)[:600]}`")
+            except Exception:
+                pass
+    return w
 
 # ---------------- new requests ----------------
 @bot.on_chat_join_request()
@@ -191,13 +206,32 @@ async def delay_panel():
 
 # ---------------- commands ----------------
 @bot.on_message(filters.command(["start", "settings", "help"]) & filters.private)
+@safe
 async def start(_, m: Message):
     if m.from_user.id not in OWNERS:
-        return await m.reply("Main ek auto join-request bot hoon.")
+        return await m.reply(f"Main ek auto join-request bot hoon.\nAapki ID: `{m.from_user.id}`")
     pending.pop(m.from_user.id, None)
     await show(m, *await main_panel())
 
+
+@bot.on_message(filters.command("id") & filters.private)
+async def my_id(_, m: Message):
+    await m.reply(f"Aapki ID: `{m.from_user.id}`\nOWNER_IDS: `{sorted(OWNERS)}`\n"
+                  f"Owner match: {m.from_user.id in OWNERS}")
+
+async def mongo_status() -> str:
+    try:
+        await asyncio.wait_for(db.command("ping"), 10)
+        return "✅ MongoDB OK"
+    except Exception as e:
+        return f"❌ MongoDB error: {type(e).__name__}: {str(e)[:500]}"
+
+@bot.on_message(filters.command("ping") & filters.private)
+async def ping(_, m: Message):
+    await m.reply(f"🏓 pong\n{await mongo_status()}\nSession (old requests): {'✅' if user else '❌'}")
+
 @bot.on_message(filters.command("approveold") & filters.private & is_owner)
+@safe
 async def cmd_old(_, m: Message):
     if not user:
         return await m.reply("SESSION_STRING set nahi hai.")
@@ -208,6 +242,7 @@ async def cmd_old(_, m: Message):
     await m.reply("▶️ Started")
 
 @bot.on_message(filters.command("stopold") & filters.private & is_owner)
+@safe
 async def cmd_stop(_, m: Message):
     t = old_tasks.get(int(m.command[1]))
     if t:
@@ -217,6 +252,7 @@ async def cmd_stop(_, m: Message):
 
 # ---------------- callbacks ----------------
 @bot.on_callback_query(is_owner)
+@safe
 async def cb(_, q: CallbackQuery):
     act, _, arg = q.data.partition(":")
     uid = q.from_user.id
@@ -292,6 +328,7 @@ async def cb(_, q: CallbackQuery):
 
 # ---------------- text input (button ke baad) ----------------
 @bot.on_message(filters.private & is_owner & ~filters.regex(r"^/"), group=1)
+@safe
 async def on_input(_, m: Message):
     state = pending.get(m.from_user.id)
     if not state:
@@ -322,7 +359,7 @@ async def on_input(_, m: Message):
             await m.reply("✅ Welcome text save + ON")
             return await show(m, *await main_panel())
     except Exception as e:
-        await m.reply(f"❌ Galat input: {e}\nDobara bhejo ya /settings dabao.")
+        await m.reply(f"❌ {type(e).__name__}: {str(e)[:500]}\nDobara bhejo ya /settings dabao.")
 
 
 # ---------------- web server + self ping ----------------
@@ -353,7 +390,13 @@ async def main():
     for _ in range(WORKERS):
         asyncio.create_task(worker())
     asyncio.create_task(self_ping())
-    log.info("Bot started")
+    status = await mongo_status()
+    log.info("Bot started | %s | owners=%s", status, sorted(OWNERS))
+    for oid in OWNERS:
+        try:
+            await bot.send_message(oid, f"🚀 Bot started\n{status}")
+        except Exception as e:
+            log.warning("owner %s ko msg nahi gaya: %s", oid, e)
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
