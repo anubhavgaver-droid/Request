@@ -6,6 +6,9 @@ from pyrogram.errors import FloodWait, RPCError, MessageNotModified
 from pyrogram.types import (ChatJoinRequest, Message, CallbackQuery,
                             InlineKeyboardMarkup, InlineKeyboardButton as B)
 
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)  # Pyrogram/Motor isi loop par bandhenge
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("joinbot")
 
@@ -400,4 +403,4 @@ async def main():
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop.run_until_complete(main())
