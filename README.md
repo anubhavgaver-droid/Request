@@ -13,6 +13,7 @@ failed requests ka reason-wise report, aur Public/Private mode.
 ## Admin (OWNER_IDS)
 - /settings -> poora panel (Active, Auto-all, Delay, Welcome, Old-Req Session, Public/Private)
 - /public aur /private -> bot sabke liye khule ya sirf admin ke liye
+- /users -> bot start karne wale sabhi users ki list (10 per page, Next/Back): naam, @username, ID, start/last time, chats, approved
 - Old-Req Session -> helper account login (phone + OTP). Sirf admin ko dikhta hai.
 
 ## Users (Public mode)

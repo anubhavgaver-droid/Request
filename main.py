@@ -59,6 +59,9 @@ REASONS = {
     "PEER_ID_INVALID": ("❓", "User nahi mila (deleted/invalid)."),
     "CHAT_ADMIN_REQUIRED": ("🔑", "Admin permission kam hai. 'Invite Users' permission do."),
 }
+def fmt_ts(ts) -> str:
+    return time.strftime("%d %b %y, %H:%M", time.gmtime(float(ts) + 19800)) + " IST"
+
 def reason_info(rid):
     return REASONS.get(rid, ("⚠️", f"Anjaan karan: {rid}"))
 def reason_of(e):
@@ -164,6 +167,19 @@ async def record_fail(cid, uid, name, username, rid, src):
                                             "reason": rid, "src": src, "ts": time.time()}}, upsert=True)
     except Exception:
         log.exception("record_fail")
+
+async def touch_user(u):
+    """Bot se baat karne wale har user ka record (sirf admin dekh sakta hai)."""
+    if not u or getattr(u, "is_bot", False):
+        return
+    now = time.time()
+    try:
+        await db.users.update_one(
+            {"_id": u.id},
+            {"$set": {"first_name": u.first_name, "last_name": u.last_name, "username": u.username, "last_seen": now},
+             "$setOnInsert": {"started": now}}, upsert=True)
+    except Exception:
+        log.exception("touch_user")
 
 async def clear_fail(cid, uid):
     try:
@@ -378,7 +394,7 @@ async def main_panel(uid: int):
               [B("📺 Chats", callback_data="chats"), B("⏱ Delay", callback_data="delay")],
               [B("👋 Welcome Text", callback_data="wt"), B("🔑 Old-Req Session", callback_data="ses")],
               [B(f"Bot Mode: {'🌐 Public' if pub else '🔒 Private'} (badlo)", callback_data="pub")],
-              [B("🔄 Refresh", callback_data="main")]]
+              [B("👥 Users", callback_data="us:0"), B("🔄 Refresh", callback_data="main")]]
     else:
         n, tot = 0, 0
         async for c in db.chats.find({"owner_id": uid}):
@@ -452,6 +468,42 @@ async def fails_panel(cid: int):
         [B("🔙 Back", callback_data=f"c:{cid}")]])
     return text, kb
 
+USERS_PER_PAGE = 10
+
+async def users_panel(page: int = 0):
+    total = await db.users.count_documents({})
+    pages = max(1, -(-total // USERS_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    now = time.time()
+    new24 = await db.users.count_documents({"started": {"$gte": now - 86400}})
+    act24 = await db.users.count_documents({"last_seen": {"$gte": now - 86400}})
+    docs = [u async for u in db.users.find({}).sort("started", -1).skip(page * USERS_PER_PAGE).limit(USERS_PER_PAGE)]
+    lines = []
+    for i, u in enumerate(docs, page * USERS_PER_PAGE + 1):
+        n_chats, appr = 0, 0
+        async for c in db.chats.find({"owner_id": u["_id"]}):
+            n_chats += 1
+            appr += c.get("approved", 0)
+        full = " ".join(x for x in (u.get("first_name"), u.get("last_name")) if x) or "NoName"
+        uname = f"@{u['username']}" if u.get("username") else "no username"
+        crown = "👑 " if u["_id"] in OWNERS else ""
+        lines.append(f"**{i}.** {crown}{mention(full, u['_id'])}\n"
+                     f"   {uname} | ID: `{u['_id']}`\n"
+                     f"   Start: {fmt_ts(u.get('started', 0))}\n"
+                     f"   Last: {fmt_ts(u.get('last_seen', 0))}\n"
+                     f"   Chats: {n_chats} | Approved: {appr}")
+    head = (f"**👥 Users**\nTotal: {total} | Naye (24h): {new24} | Active (24h): {act24}\n"
+            f"Page {page + 1}/{pages}\n\n")
+    text = (head + ("\n\n".join(lines) if lines else "Abhi koi user record nahi hai."))[:4000]
+    nav = []
+    if page > 0:
+        nav.append(B("⬅️ Back", callback_data=f"us:{page - 1}"))
+    nav.append(B(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(B("Next ➡️", callback_data=f"us:{page + 1}"))
+    return text, InlineKeyboardMarkup([nav, [B("🔙 Menu", callback_data="main")]])
+
+
 async def delay_panel():
     g = await gcfg()
     kb = InlineKeyboardMarkup([
@@ -483,6 +535,7 @@ def helper_panel():
 @safe
 async def start(_, m: Message):
     uid = m.from_user.id
+    await touch_user(m.from_user)
     if uid not in OWNERS and not STATE["public"]:
         return await m.reply(f"🔒 Ye bot abhi private hai.\nAapki ID: `{uid}`")
     await cancel_login(uid)
@@ -517,6 +570,11 @@ async def cmd_mode(_, m: Message):
     await m.reply("🌐 Bot ab **Public** hai: koi bhi apne chat add kar sakta hai." if pub
                   else "🔒 Bot ab **Private** hai: sirf admin panel use kar sakta hai.\n"
                        "(Pehle se add chats me approve chalta rahega.)")
+
+@bot.on_message(filters.command("users") & filters.private & is_owner)
+@safe
+async def cmd_users(_, m: Message):
+    await show(m, *await users_panel(0))
 
 @bot.on_message(filters.command("approveold") & filters.private & is_owner)
 @safe
@@ -586,7 +644,7 @@ async def on_member(_, u):
 
 
 # ---------------- callbacks ----------------
-OWNER_ACTS = {"g", "ses", "lg", "ls", "lo", "delay", "dp", "dc", "wt", "pub"}
+OWNER_ACTS = {"us", "g", "ses", "lg", "ls", "lo", "delay", "dp", "dc", "wt", "pub"}
 CHAT_ACTS = {"c", "ct", "cr", "cd", "co", "cs", "cx", "cw", "ce", "fr", "fc", "fq"}
 
 @bot.on_callback_query(is_user)
@@ -594,12 +652,17 @@ CHAT_ACTS = {"c", "ct", "cr", "cd", "co", "cs", "cx", "cw", "ce", "fr", "fc", "f
 async def cb(_, q: CallbackQuery):
     act, _, arg = q.data.partition(":")
     uid = q.from_user.id
+    await touch_user(q.from_user)
     try:
         if act in OWNER_ACTS and uid not in OWNERS:
             return await q.answer("Ye option sirf admin ke liye hai.", show_alert=True)
         if act in CHAT_ACTS and not await can_manage(uid, int(arg)):
             return await q.answer("Aapko is chat ki access nahi hai.", show_alert=True)
 
+        if act == "noop":
+            return
+        if act == "us":
+            return await show(q, *await users_panel(int(arg)))
         if act == "main":
             await cancel_login(uid)
             return await show(q, *await main_panel(uid))
@@ -726,6 +789,7 @@ async def on_input(_, m: Message):
     st = pending.get(uid)
     if not st:
         return
+    await touch_user(m.from_user)
     kind = st[0]
     if kind in OWNER_KINDS and uid not in OWNERS:
         pending.pop(uid, None)
@@ -813,9 +877,9 @@ async def on_input(_, m: Message):
                               "ya abhi tak try hi nahi hui.")
             else:
                 e, d = reason_info(f["reason"])
-                when = time.strftime("%d %b %Y %H:%M", time.gmtime(f["ts"] + 19800))
+                when = fmt_ts(f["ts"])
                 await m.reply(f"{e} {mention(f.get('name'), target)} `{target}`\n\n**Reason:** {d}\n"
-                              f"Code: `{f['reason']}`\nKab: {when} IST ({'purani' if f.get('src') == 'old' else 'nayi'} request)")
+                              f"Code: `{f['reason']}`\nKab: {when} ({'purani' if f.get('src') == 'old' else 'nayi'} request)")
             return await show(m, *await fails_panel(st[1]))
     except Exception as e:
         if isinstance(e, UserError):
