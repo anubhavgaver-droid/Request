@@ -1,32 +1,24 @@
-# Telegram Auto Join Request Bot
+# Telegram Auto Join Request Bot (+ Clone Bots, Hindi/English)
 
 Auto-approve (human-like delay), purani requests (helper account), Failed Report, Public/Private mode,
-Free/Premium plans, Hindi/English, Captcha, Force Subscribe, Log channel + alerts, User ban.
+Users list, aur **Clone Bot** feature. Har user /start ke baad apni bhasha (हिंदी / English) chun sakta hai.
 
 ## Render (Web Service)
 - Build: `pip install -r requirements.txt`   Start: `python main.py`
 - Env vars: .env.example ke hisaab se (+ `PYTHON_VERSION=3.11.9` recommended)
 - MongoDB Atlas: Network Access me 0.0.0.0/0 allow karo
+- **SECRET_KEY** zaroor set karo (kuch bhi lamba random text) aur kabhi mat badlo.
 
-## Admin commands (OWNER_IDS)
-/settings  panel | /public /private  mode | /users  users list (10/page)
-/premium <id> <days>   Premium do (days jodte jate hain) | /free <id>  Premium hatao | /premiums  list
-/ban <id>  /unban <id>  /banned  list
-Panel: Log Channel (set/test/remove), Old-Req Session (helper login), Users -> Ban/Premium buttons
+## Clone Bot kaise kaam karta hai
+1. User main bot me **🤖 Clone Bot** dabata hai, @BotFather se naya bot banata hai aur uska token bhejta hai.
+2. Bot token ko turant chat se delete kar deta hai aur encrypt karke save karta hai.
+3. Clone usi process me chalta hai, par **uska data alag** hai (chats, settings, users, helper session).
+4. Clone ka owner = wahi user. Clone me wahi commands/panel milte hain jo main bot me admin ke paas hain.
+5. Old requests ke liye clone owner ko **apna khud ka helper account** clone ke andar login karna hota hai
+   (Settings -> Old-Req Session) aur use apne chats me admin banana hota hai.
+6. Ek account se **ek hi clone**. User jab chahe 🗑 se delete kar sakta hai (data bhi hat jata hai).
+7. Main admin: `/settings` -> **🤖 Clones (Admin)**: list, stop/start, delete, aur clone feature ON/OFF.
+- Clone feature tabhi users ko milta hai jab main bot **Public** ho (`/public`).
 
-## Plans
-Free: FREE_CHATS chats, auto approve, delay, welcome DM, failed report
-Premium: PREMIUM_CHATS chats + Captcha (human button / math) + Force Subscribe + old requests approve
-Premium khatam hote hi captcha/force-sub apne-aap band ho jate hain, user ko DM jata hai.
-
-## Captcha / Force Subscribe (Premium)
-Chat -> Captcha button cycles Off -> Human -> Math. Force Subscribe: max 3 channels (bot unme admin ho).
-User ko request ke baad bot DM karta hai; GATE_MINUTES me verify/join na kare to request decline.
-Failed ones Failed Report me dikhte hain.
-
-## Log channel / alerts
-Naye users, naye chats, premium/ban changes, errors, bot hataye jaane par, helper session mar jaane par.
-Log channel set nahi to important alerts owners ko DM aate hain.
-
-## Helper account (old requests)
-Settings -> Old-Req Session -> Login (phone + OTP). Secondary account use karo, chat me admin banao.
+## Admin commands (main aur clone dono me, apne owner ke liye)
+/settings panel | /public /private mode | /users users list (10/page) | /approveold <id> | /stopold <id> | /ping | /id

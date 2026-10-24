@@ -1,4 +1,4 @@
-import os, re, asyncio, random, logging, functools, time, math
+import os, re, asyncio, random, logging, functools, time, contextvars, hashlib, base64
 from collections import Counter
 from aiohttp import web, ClientSession
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -10,8 +10,14 @@ from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import (FloodWait, RPCError, MessageNotModified, SessionPasswordNeeded,
                              PhoneCodeInvalid, PhoneCodeExpired)
+from pyrogram.handlers import (MessageHandler, CallbackQueryHandler, ChatJoinRequestHandler,
+                               ChatMemberUpdatedHandler)
 from pyrogram.types import (ChatJoinRequest, Message, CallbackQuery,
                             InlineKeyboardMarkup, InlineKeyboardButton as B)
+try:
+    from cryptography.fernet import Fernet
+except Exception:  # cryptography na ho to tokens/sessions plain store honge (requirements.txt me hai)
+    Fernet = None
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("joinbot")
@@ -20,66 +26,164 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 MONGO_URI = os.environ["MONGO_URI"]
-OWNERS = {int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").split(",") if x}
-SESSION_STRING = os.environ.get("SESSION_STRING")          # optional (bot ke andar bhi login ho sakta hai)
+MAIN_OWNERS = {int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").split(",") if x}
+SESSION_STRING = os.environ.get("SESSION_STRING")          # optional (sirf main bot ke liye)
 PORT = int(os.environ.get("PORT", 8080))
 SELF_URL = os.environ.get("RENDER_EXTERNAL_URL")
 WORKERS = int(os.environ.get("WORKERS", 8))
-FREE_CHATS = int(os.environ.get("FREE_CHATS", 2))           # Free plan: max chats
-PREMIUM_CHATS = int(os.environ.get("PREMIUM_CHATS", 20))    # Premium plan: max chats
-GATE_MINUTES = int(os.environ.get("GATE_MINUTES", 30))      # captcha / force-sub ka time limit
-ADMIN_CONTACT = os.environ.get("ADMIN_CONTACT", "")         # jaise @myusername (Premium lene ke liye)
-ENV_LOG = os.environ.get("LOG_CHAT_ID")                     # optional log channel
+CLONE_WORKERS = int(os.environ.get("CLONE_WORKERS", 3))     # har clone ke workers
+MAX_CLONES = int(os.environ.get("MAX_CLONES", 10))          # total clones (RAM bachane ke liye)
+MAX_CHATS = int(os.environ.get("MAX_CHATS_PER_USER", 10))   # public mode me ek user ke max chats
+SECRET_KEY = os.environ.get("SECRET_KEY") or (API_HASH + "|joinbot-v1")
 PAGE = 8
 
-db = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)["joinbot"]
-bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
-user = None      # helper (user) account
-helper = None    # {"id", "name", "username"}
-BOT_ID = {"id": 0}
-STATE = {"public": False}
-LOG = {"chat": None}
-BANNED: set = set()
-LANG: dict = {}
+MDB = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)["joinbot"]
 
-queue: asyncio.Queue = asyncio.Queue()
-old_tasks: dict = {}
-old_sem = asyncio.Semaphore(1)
-logins: dict = {}
-pending: dict = {}
+
+# ======================= multi-bot core (main + clones) =======================
+CUR = contextvars.ContextVar("inst")     # abhi kaunsa bot (main/clone) handler chala raha hai
+
+class Store:
+    """Ek bot ka alag data (collections prefix se). Main = '' (purana data wahi), clone = 'c<id>_'."""
+    NAMES = ("chats", "settings", "fails", "users")
+    def __init__(self, prefix: str = ""):
+        self.prefix = prefix
+        for n in self.NAMES:
+            setattr(self, n, MDB[prefix + n])
+    async def drop(self):
+        for n in self.NAMES:
+            await MDB[self.prefix + n].drop()
+
+class Inst:
+    def __init__(self, key, client, owners, store, clone_owner=None, bot_id=0):
+        self.key, self.client, self.owners, self.db = key, client, set(owners), store
+        self.is_clone = clone_owner is not None
+        self.clone_owner = clone_owner
+        self.user = None            # helper (user) account
+        self.helper = None          # {"id", "name", "username"}
+        self.state = {"public": False}
+        self.queue = asyncio.Queue()
+        self.old_tasks = {}
+        self.old_sem = asyncio.Semaphore(1)   # ek time par ek hi old-approve (flood se bachav)
+        self.logins, self.pending, self.langs = {}, {}, {}
+        self.bot_id = {"id": bot_id}
+        self.workers = []
+        self.username = ""
+
+class P:
+    """Module-level naam (db, bot, OWNERS...) ko 'abhi wale bot' ke attribute par bhejta hai."""
+    __slots__ = ("_a",)
+    def __init__(self, a): object.__setattr__(self, "_a", a)
+    def _t(self): return getattr(CUR.get(), object.__getattribute__(self, "_a"))
+    def __getattr__(self, n): return getattr(self._t(), n)
+    def __getitem__(self, k): return self._t()[k]
+    def __setitem__(self, k, v): self._t()[k] = v
+    def __delitem__(self, k): del self._t()[k]
+    def __contains__(self, k): return k in self._t()
+    def __iter__(self): return iter(self._t())
+    def __len__(self): return len(self._t())
+    def __bool__(self): return bool(self._t())
+    async def __aenter__(self): return await self._t().__aenter__()   # async with old_sem:
+    async def __aexit__(self, *a): return await self._t().__aexit__(*a)
+
+db, bot, user, helper = P("db"), P("client"), P("user"), P("helper")
+OWNERS, STATE, queue = P("owners"), P("state"), P("queue")
+old_tasks, old_sem, logins, pending = P("old_tasks"), P("old_sem"), P("logins"), P("pending")
+LANG, BOT_ID, IS_CLONE = P("langs"), P("bot_id"), P("is_clone")
+
+INSTANCES: dict = {}       # client.name -> Inst
+RUNNING: dict = {}         # clone bot_id -> Inst
+CLONES = MDB["clones"]     # clones ka registry (sirf main store me)
+
+MAIN = Inst("main", Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True),
+            MAIN_OWNERS, Store(""))
+INSTANCES[MAIN.client.name] = MAIN
+
+async def run_in(inst, fn, *a, **k):
+    tok = CUR.set(inst)
+    try:
+        return await fn(*a, **k)
+    finally:
+        CUR.reset(tok)
+
+# ---- handler registry: ek hi handlers sab bots (main + clones) par lagte hain
+HANDLERS = []
+def on_message(flt, group=0):
+    def d(fn): HANDLERS.append((MessageHandler, fn, flt, group)); return fn
+    return d
+def on_callback(flt):
+    def d(fn): HANDLERS.append((CallbackQueryHandler, fn, flt, 0)); return fn
+    return d
+def on_join_request():
+    def d(fn): HANDLERS.append((ChatJoinRequestHandler, fn, None, 0)); return fn
+    return d
+def on_member_update():
+    def d(fn): HANDLERS.append((ChatMemberUpdatedHandler, fn, None, 0)); return fn
+    return d
+
+def bind(fn, inst):
+    @functools.wraps(fn)
+    async def w(client, *a, **k):
+        tok = CUR.set(inst)
+        try:
+            return await fn(client, *a, **k)
+        finally:
+            CUR.reset(tok)
+    return w
+
+def attach(inst):
+    for H, fn, flt, group in HANDLERS:
+        inst.client.add_handler(H(bind(fn, inst), flt) if flt is not None else H(bind(fn, inst)), group)
+
+# ---- tokens / sessions ko database me encrypt karke rakhna
+_F = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest())) if Fernet else None
+def enc(s: str) -> str:
+    return "enc:" + _F.encrypt(s.encode()).decode() if _F else s
+def dec(s):
+    if s and s.startswith("enc:"):
+        try:
+            return _F.decrypt(s[4:].encode()).decode()
+        except Exception:
+            return None
+    return s
+
 
 DEFAULTS = {"active": True, "auto_all": True, "min": 2, "max": 15, "welcome_on": False, "public": False,
-            "welcome": "Hello {name}! {chat} me aapki request approve ho gayi hai."}
+            "clone_on": True, "welcome": "Hello {name}! {chat} me aapki request approve ho gayi hai."}
 tick = lambda b: "✅" if b else "❌"
 clean = lambda t: re.sub(r"[\[\]*_`~|]", "", str(t))
-AUTH_DEAD = {"AUTH_KEY_UNREGISTERED", "SESSION_REVOKED", "SESSION_EXPIRED", "AUTH_KEY_INVALID",
-             "USER_DEACTIVATED", "USER_DEACTIVATED_BAN", "AUTH_KEY_DUPLICATED"}
+TOKEN_RE = re.compile(r"\d{6,12}:[A-Za-z0-9_-]{30,50}")
 
 
 # ======================= TEXTS (Hindi / English) =======================
 TX = {
 "hi": {
  "back": "🔙 वापस", "refresh": "🔄 रीफ्रेश", "my_chats": "📺 मेरे चैट", "add_chat": "➕ चैट जोड़ें",
- "old_help_btn": "ℹ️ पुरानी रिक्वेस्ट मदद", "plan_btn": "💎 प्लान", "lang_btn": "🌐 भाषा: हिंदी",
- "plan_free": "Free", "plan_prem": "Premium ({d} दिन बाकी)", "plan_prem_owner": "Premium (Admin)",
+ "old_help_btn": "ℹ️ पुरानी रिक्वेस्ट मदद", "lang_btn": "🌐 भाषा: हिंदी", "myclone_btn": "🤖 क्लोन बॉट",
+ "private_bot": "🔒 यह बॉट अभी प्राइवेट है।\nआपकी ID: `{uid}`",
  "user_main": "**🤖 ऑटो जॉइन रिक्वेस्ट बॉट**\n\nअपने चैनल/ग्रुप की जॉइन रिक्वेस्ट अपने-आप approve कराओ।\n\n"
               "1️⃣ बॉट को अपने चैट में **admin** बनाओ (\"Invite Users\" permission के साथ)\n"
               "2️⃣ चैट अपने-आप जुड़ जाएगा, या ➕ चैट जोड़ें दबाओ\n3️⃣ 📺 मेरे चैट में सेटिंग्स बदलो\n\n"
-              "💎 प्लान: **{plan}** | चैट: {n}/{lim}\nApproved: {tot}",
- "private_bot": "🔒 यह बॉट अभी प्राइवेट है।\nआपकी ID: `{uid}`",
- "banned": "🚫 आपको इस बॉट से बैन कर दिया गया है।",
+              "आपके चैट: {n} | Approved: {tot}",
+ "admin_main": "**⚙️ ऑटो जॉइन रिक्वेस्ट बॉट (Admin){tag}**\n\nमोड: {mode}\nडिले: {lo}-{hi}s | कतार: {q}\n"
+               "कुल approved: {tot}\nHelper session: {hs}\n\n{hint}",
+ "tag_clone": " — क्लोन", "mode_pub": "🌐 Public", "mode_priv": "🔒 Private",
+ "hint_pub": "Public मोड में Auto-all OFF रखना बेहतर है।",
+ "hint_nohelper": "💡 पुरानी pending रिक्वेस्ट के लिए 🔑 Old-Req Session से **अपना खुद का** helper अकाउंट लॉगिन करें।",
+ "b_active": "बॉट चालू {s}", "b_autoall": "Auto-all चैट {s}", "b_wg": "वेलकम DM (ग्लोबल) {s}",
+ "b_chats": "📺 चैट", "b_gdelay": "⏱ डिले", "b_gwtext": "👋 वेलकम टेक्स्ट", "b_sess": "🔑 Old-Req Session",
+ "b_mode": "बॉट मोड: {m} (बदलो)", "b_users": "👥 Users", "b_clones_admin": "🤖 क्लोन (Admin)",
+ "mode_set_pub": "🌐 बॉट अब **Public** है: कोई भी अपने चैट जोड़ सकता है।",
+ "mode_set_priv": "🔒 बॉट अब **Private** है: सिर्फ admin पैनल इस्तेमाल कर सकता है।\n(पहले से जुड़े चैट में approve चलता रहेगा।)",
  "chats_hint": "**📺 चैट ({n})**\nसेटिंग्स खोलने के लिए चैट पर टैप करो।",
  "add_prompt": "चैट की ID (`-100...`), @username भेजो, या चैनल/ग्रुप का कोई मैसेज फॉरवर्ड करो।\n"
                "बॉट उस चैट में admin होना चाहिए और आप भी उस चैट के admin।",
- "chat_text": "**{title}**\n`{cid}`\n\nApprove: {on}\nDelay: {lo}-{hi}s {dt}\nWelcome DM: {w}\n"
-              "🛡 कैप्चा: {cap}\n📢 Force Subscribe: {fs} चैनल\n🌐 DM भाषा: {cl}\n"
-              "Approved: {ap} | Failed records: {nf}\nOld task: {old}",
- "custom": "(कस्टम)", "global": "(ग्लोबल)", "running": "चल रहा ▶️", "idle": "खाली",
- "b_approve": "Approve {s}", "b_delay": "⏱ कस्टम डिले", "b_reset": "♻️ रीसेट", "b_wdm": "वेलकम DM {s}",
- "b_wtext": "✏️ वेलकम टेक्स्ट", "b_cap": "🛡 कैप्चा: {m}{lock}", "b_fs": "📢 Force Subscribe ({n}){lock}",
- "b_cl": "🌐 DM भाषा: {l}", "b_old": "🕰 पुरानी रिक्वेस्ट approve{lock}", "b_oldstop": "⏹ पुरानी approve रोको",
+ "chat_text": "**{title}**\n`{cid}`\n\nApprove: {on}\nडिले: {lo}-{hi}s {dt}\nवेलकम DM: {w}\n"
+              "Approved: {ap} | Failed records: {nf}\nपुरानी task: {old}",
+ "custom": "(कस्टम)", "global": "(ग्लोबल)", "running": "चल रही ▶️", "idle": "खाली",
+ "b_approve": "Approve {s}", "b_cdelay": "⏱ कस्टम डिले", "b_reset": "♻️ रीसेट", "b_wdm": "वेलकम DM {s}",
+ "b_wtext": "✏️ वेलकम टेक्स्ट", "b_old": "🕰 पुरानी रिक्वेस्ट approve", "b_oldstop": "⏹ पुरानी approve रोको",
  "b_fail": "❌ फेल रिपोर्ट", "b_help": "ℹ️ Helper जानकारी", "b_rm": "🗑 हटाओ",
- "cap_off": "बंद", "cap_human": "इंसान बटन", "cap_math": "गणित", "lang_hi": "हिंदी", "lang_en": "English",
  "f_title": "**❌ फेल रिपोर्ट — {title}**", "f_none": "✅ कोई failed रिक्वेस्ट रिकॉर्ड नहीं है।",
  "f_total": "कुल: {n}", "f_recent": "**हाल के:**", "f_check": "🔍 एक यूज़र चेक करो", "f_clear": "🧹 रिपोर्ट साफ़",
  "f_ask": "जिस यूज़र का कारण देखना है उसकी **User ID** भेजो (नंबर)।",
@@ -101,11 +205,7 @@ TX = {
  "old_detail": "\n\nडिटेल: चैट → ❌ फेल रिपोर्ट",
  "old_stopped": "🛑 रोक दिया `{cid}`। Approved: {ok}",
  "old_err": "❌ Error `{cid}`: {e}",
- "locked": "💎 यह Premium फीचर है। 💎 प्लान दबाकर देखो।",
- "max_chats": "आपके प्लान में अधिकतम {lim} चैट जुड़ सकते हैं। ज़्यादा के लिए Premium लो (💎 प्लान)।",
- "plan_text": "**💎 प्लान**\n\nआपका प्लान: **{plan}**\n\n**Free**\n• {fc} चैट तक\n• ऑटो approve, डिले, वेलकम DM, फेल रिपोर्ट\n\n"
-              "**Premium**\n• {pc} चैट तक\n• 🛡 कैप्चा (इंसान बटन / गणित)\n• 📢 Force Subscribe\n• 🕰 पुरानी रिक्वेस्ट approve\n\n"
-              "Premium के लिए संपर्क करो: {contact}",
+ "old_started": "▶️ शुरू हो गया", "old_nothing": "कोई task नहीं है।", "old_stopping": "🛑 रोक रहे हैं...",
  "e_notfound": "चैट नहीं मिला। पहले बॉट को उस चैट में admin बनाओ, फिर ID/@username या फॉरवर्ड किया मैसेज भेजो।",
  "e_notadmin_user": "आप इस चैट के admin नहीं लग रहे।",
  "e_onlyadmin": "सिर्फ चैट के admin/owner ही चैट जोड़ सकते हैं।",
@@ -114,31 +214,40 @@ TX = {
  "e_bot_noinvite": "बॉट को \"Invite Users\" (Add Members) permission दो।",
  "e_delay": "डिले 1 से 300 सेकंड के बीच रखो।",
  "e_tpl": "टेक्स्ट में सिर्फ {{name}} और {{chat}} इस्तेमाल करो (दूसरे {{ }} नहीं)।",
- "e_nolink": "इस चैनल का public username नहीं है और बॉट invite link नहीं बना पाया। बॉट को \"Invite Users\" permission दो।",
+ "max_chats": "एक यूज़र अधिकतम {lim} चैट जोड़ सकता है।",
  "added": "✅ जुड़ गया: {title}",
  "member_added": "✅ **{title}** जुड़ गया!{warn}\n\n{note}\n\nसेटिंग्स के लिए /settings → 📺 मेरे चैट",
  "warn_noinvite": "\n\n⚠️ बॉट को \"Invite Users\" permission नहीं मिली, इसके बिना रिक्वेस्ट approve नहीं होंगी।",
- "bot_removed": "⚠️ बॉट को **{title}** से हटा दिया गया है, अब वहाँ रिक्वेस्ट approve नहीं होंगी।",
- "bot_demoted": "⚠️ **{title}** में बॉट का admin हटा दिया गया है, अब रिक्वेस्ट approve नहीं होंगी।",
  "cd_prompt": "इस चैट का डिले भेजो: `min max` (जैसे `3 12`)",
  "ce_prompt": "इस चैट के लिए नया वेलकम DM टेक्स्ट भेजो। {{name}} और {{chat}} इस्तेमाल कर सकते हो।",
- "saved_w": "✅ इस चैट का वेलकम DM सेव + ON",
+ "wt_prompt": "अभी: `{cur}`\n\nनया ग्लोबल वेलकम टेक्स्ट भेजो। {{name}} और {{chat}} इस्तेमाल कर सकते हो।",
+ "gd_prompt": "ग्लोबल डिले भेजो: `min max` (जैसे `2 15`)",
+ "saved_w": "✅ इस चैट का वेलकम DM सेव + ON", "saved_gw": "✅ ग्लोबल वेलकम टेक्स्ट सेव + ON",
  "q_no_access": "आपको इस चैट की access नहीं है।", "q_owner_only": "यह option सिर्फ admin के लिए है।",
+ "q_main_only": "यह फीचर सिर्फ मुख्य बॉट में है।",
  "q_removed": "हटा दिया", "q_clear": "रिपोर्ट साफ़", "q_stopping": "रोक रहे हैं...", "q_started": "पुरानी approve शुरू ▶️",
- "fs_title": "**📢 Force Subscribe — {title}**\n\nरिक्वेस्ट approve होने से पहले यूज़र को ये चैनल जॉइन करने होंगे (अधिकतम 3)। "
-             "बॉट को उन चैनलों में **admin** होना चाहिए।\n\n{items}",
- "fs_empty": "अभी कोई चैनल नहीं जोड़ा।", "fs_add": "➕ चैनल जोड़ें", "fs_max": "अधिकतम 3 चैनल जोड़ सकते हो।",
- "fs_ask": "जो चैनल जोड़ना है उसकी ID, @username भेजो या उसका कोई मैसेज फॉरवर्ड करो।",
- "cap_msg_human": "🛡 आपने **{chat}** में जॉइन रिक्वेस्ट भेजी है।\n\nवेरिफाई करने के लिए नीचे बटन दबाओ। ({m} मिनट में)",
- "human_btn": "✅ मैं इंसान हूँ",
- "cap_msg_math": "🛡 आपने **{chat}** में जॉइन रिक्वेस्ट भेजी है।\n\nवेरिफाई करने के लिए सही जवाब चुनो:\n\n**{q} = ?**\n\n({m} मिनट में)",
- "cap_wrong": "❌ गलत जवाब। नया सवाल देखो।",
- "cap_failed": "❌ वेरिफिकेशन फेल। आपकी रिक्वेस्ट रद्द कर दी गई है, चाहो तो दोबारा रिक्वेस्ट भेजो।",
- "cap_ok": "✅ वेरिफाई हो गया! आपकी रिक्वेस्ट approve हो रही है।",
- "gate_expired": "⌛ समय खत्म। दोबारा जॉइन रिक्वेस्ट भेजो।",
- "fs_msg": "📢 **{chat}** में approve होने के लिए पहले ये चैनल जॉइन करो, फिर नीचे \"मैंने जॉइन कर लिया\" दबाओ।",
- "joined_btn": "✅ मैंने जॉइन कर लिया", "not_joined": "आपने अभी सारे चैनल जॉइन नहीं किए।",
- "fs_ok": "✅ बढ़िया! आपकी रिक्वेस्ट approve हो रही है।",
+ "in_err": "❌ गलत इनपुट", "in_err_full": "❌ {d}\nदोबारा भेजो या /settings दबाओ।",
+ "ses_in": "**🔑 Old-Request Session**\n\nलॉगिन: {who} (`{hid}`) ✅\n\nयह अकाउंट हर चैट में **admin** होना चाहिए (Invite Users)। "
+           "यूज़र्स को बॉट ये जानकारी खुद दिखाता है।",
+ "ses_out": "**🔑 Old-Request Session**\n\nअभी कोई session नहीं है ❌\nपुरानी pending रिक्वेस्ट के लिए एक यूज़र अकाउंट लॉगिन करो "
+            "(बेहतर: अलग/secondary अकाउंट)।",
+ "ses_clone_note": "\n\n🤖 **क्लोन बॉट के लिए नियम:** यह आपके क्लोन का **अपना** helper अकाउंट है, मुख्य बॉट का नहीं। "
+                   "कृपया अपने ही Telegram अकाउंट से (बेहतर: एक अलग अकाउंट से) खुद लॉगिन करें, फिर उसे अपने चैट में admin बनाएँ। "
+                   "किसी और का अकाउंट या session उसकी अनुमति के बिना इस्तेमाल न करें।",
+ "b_login": "📲 लॉगिन (फोन + OTP)", "b_paste": "📋 Session String पेस्ट करो", "b_logout": "🚪 लॉगआउट / हटाओ",
+ "ses_phone": "📲 Helper अकाउंट का फोन नंबर देश-कोड के साथ भेजो, जैसे `+919876543210`",
+ "ses_str": "📋 Pyrogram SESSION_STRING पेस्ट करो (मैसेज तुरंत डिलीट कर दिया जाएगा)।",
+ "ses_otp": "📨 Telegram ने उस अकाउंट पर OTP भेजा है।\n\nकोड **स्पेस के साथ** भेजो, जैसे `1 2 3 4 5` "
+            "(सीधे भेजोगे तो Telegram कोड ब्लॉक कर देता है)।",
+ "ses_2fa": "🔐 2-step verification password भेजो (मैसेज डिलीट हो जाएगा)।",
+ "ses_ok": "✅ लॉगिन हो गया! Session सेव हो गया है।", "ses_set": "✅ Session सेट हो गया।", "ses_bye": "लॉगआउट हो गया",
+ "ses_fail": "❌ {err}\nफिर से लॉगिन बटन दबाओ।",
+ "u_head": "**👥 Users**\nकुल: {total} | नए (24h): {new24} | सक्रिय (24h): {act24}\nपेज {p}/{pages}\n\n",
+ "u_entry": "**{i}.** {crown}{who}\n   {uname} | ID: `{uid}`\n   Start: {st}\n   Last: {last}\n   चैट: {nc} | Approved: {ap}",
+ "u_none": "अभी कोई यूज़र रिकॉर्ड नहीं है।", "no_username": "no username",
+ "nav_back": "⬅️ पिछला", "nav_next": "अगला ➡️", "b_menu": "🔙 मेन्यू",
+ "dl_title": "**⏱ ग्लोबल डिले**\nअभी: {lo}-{hi}s", "b_custom": "✏️ कस्टम",
+ "ping_full": "🏓 pong\n{mongo}\nHelper session: {h}\nमोड: {mode}\nक्लोन: {nc}",
  "r_USER_CHANNELS_TOO_MUCH": "यूज़र Telegram की 500 चैनल/ग्रुप वाली सीमा पर है, इसलिए और कहीं जॉइन नहीं हो सकता। (कोई उपाय नहीं)",
  "r_USER_DEACTIVATED": "अकाउंट डिलीट/डिएक्टिवेट हो चुका है।",
  "r_USER_DEACTIVATED_BAN": "अकाउंट Telegram ने बैन कर दिया है।",
@@ -148,35 +257,72 @@ TX = {
  "r_USER_PRIVACY_RESTRICTED": "यूज़र की प्राइवेसी सेटिंग्स की वजह से add नहीं हो सकता।",
  "r_USER_ID_INVALID": "यूज़र नहीं मिला (डिलीट/invalid)।",
  "r_CHAT_ADMIN_REQUIRED": "Admin permission कम है। \"Invite Users\" permission दो।",
- "r_CAPTCHA_DM_FAILED": "कैप्चा का मैसेज यूज़र को नहीं भेजा जा सका।",
- "r_CAPTCHA_FAILED": "कैप्चा में 3 बार गलत जवाब, रिक्वेस्ट रद्द।",
- "r_GATE_TIMEOUT": "यूज़र ने समय पर वेरिफाई/जॉइन नहीं किया, रिक्वेस्ट रद्द।",
  "r_unknown": "अनजान कारण: {rid}",
- "prem_got": "💎 आपको **Premium** मिल गया है: {d} दिन।\nनए फीचर: कैप्चा, Force Subscribe, पुरानी रिक्वेस्ट approve।",
- "prem_end": "⌛ आपका Premium खत्म हो गया। Premium फीचर बंद हो गए हैं। दोबारा लेने के लिए 💎 प्लान देखो।",
+ # ---- clone
+ "k_rules": "**🤖 क्लोन बॉट — अपना खुद का बॉट**\n\nयहाँ से आप इसी बॉट जैसा **अपना बॉट** बना सकते हो, जिसके आप खुद admin होगे। नियम:\n\n"
+            "1️⃣ @BotFather → /newbot से नया बॉट बनाओ और उसका **टोकन** यहाँ भेजो।\n"
+            "2️⃣ आपके क्लोन का डेटा (चैट, सेटिंग्स, यूज़र) मुख्य बॉट से **बिल्कुल अलग** रहता है।\n"
+            "3️⃣ क्लोन में कमांड और पैनल वही हैं जो इस बॉट में admin के पास हैं।\n"
+            "4️⃣ पुरानी pending रिक्वेस्ट के लिए क्लोन के अंदर **अपना खुद का** helper अकाउंट लॉगिन करना होगा "
+            "(⚙️ Settings → 🔑 Old-Req Session) और उसे अपने चैट में admin बनाना होगा।\n"
+            "5️⃣ एक अकाउंट से **सिर्फ एक** क्लोन बन सकता है, और आप जब चाहें उसे डिलीट कर सकते हो।\n"
+            "6️⃣ टोकन किसी और को न दें। आपका टोकन और session एन्क्रिप्ट करके सेव होते हैं।",
+ "k_have": "**🤖 आपका क्लोन बॉट**\n\nबॉट: @{u}\nस्टेटस: {st}\nबना: {when}\n\nआप इसके admin हो। कमांड/पैनल वही हैं जो इस बॉट में admin के पास हैं। "
+           "पुरानी रिक्वेस्ट के लिए क्लोन के अंदर अपना खुद का helper अकाउंट लॉगिन करें।",
+ "k_st_run": "चालू ✅", "k_st_stop": "बंद ⏸",
+ "k_open": "🔗 @{u} खोलो", "k_new": "➕ क्लोन बनाओ", "k_restart": "🔄 रीस्टार्ट", "k_del": "🗑 क्लोन डिलीट",
+ "k_yes": "✅ हाँ, डिलीट करो", "k_no": "❌ नहीं",
+ "k_ask_token": "अपने नए बॉट का **टोकन** भेजो (@BotFather → /newbot से मिलता है)।\n\n⚠️ टोकन किसी और को न दें। यह मैसेज मैं तुरंत डिलीट कर दूँगा।",
+ "k_badtoken": "टोकन का फॉर्मेट सही नहीं है। @BotFather वाला पूरा टोकन भेजो (जैसे `123456:ABC...`)।",
+ "k_same": "यह इसी (मुख्य) बॉट का टोकन है। अपना नया बॉट बनाकर उसका टोकन दो।",
+ "k_dup": "इस टोकन से पहले ही क्लोन बना हुआ है।",
+ "k_one": "आपका एक क्लोन पहले से है। नया बनाने के लिए पहले उसे डिलीट करो।",
+ "k_full": "अभी क्लोन की सीमा पूरी हो चुकी है। कृपया बाद में कोशिश करें।",
+ "k_off": "क्लोन फीचर अभी बंद है।",
+ "k_invalid": "इस टोकन से बॉट शुरू नहीं हो सका। जाँच लो कि टोकन सही और चालू है, फिर दोबारा भेजो।",
+ "k_wait": "⏳ क्लोन शुरू कर रहा हूँ...",
+ "k_done": "✅ आपका क्लोन बॉट तैयार है: @{u}\n\n1️⃣ @{u} खोलकर /start दबाओ — वहाँ आप **admin** हो।\n"
+           "2️⃣ वहाँ के कमांड/पैनल वैसे ही हैं जैसे इस बॉट में admin के पास हैं।\n"
+           "3️⃣ पुरानी pending रिक्वेस्ट के लिए क्लोन में ⚙️ Settings → 🔑 Old-Req Session से **अपना खुद का** helper अकाउंट लॉगिन करें "
+           "(बेहतर: अलग अकाउंट), और उसे अपने चैट में admin बनाएँ।\n"
+           "4️⃣ एक अकाउंट से एक ही क्लोन बन सकता है; जब चाहें 🗑 से डिलीट कर सकते हैं।",
+ "k_deleted": "🗑 क्लोन डिलीट हो गया और उसका सारा डेटा हटा दिया गया। चाहो तो @BotFather में बॉट डिलीट/टोकन revoke भी कर दो।",
+ "k_del_ask": "⚠️ क्या आप सच में अपना क्लोन **@{u}** डिलीट करना चाहते हो? उसके चैट/सेटिंग्स/यूज़र का सारा डेटा हमेशा के लिए हट जाएगा।",
+ "k_restarted": "🔄 क्लोन रीस्टार्ट हो गया।",
+ "k_admin_removed": "⚠️ आपका क्लोन बॉट admin द्वारा हटा दिया गया है।",
+ "k_failed_boot": "⚠️ आपका क्लोन **@{u}** शुरू नहीं हो पाया (टोकन बदला/revoke तो नहीं हुआ?)। 🤖 क्लोन बॉट से दोबारा बनाओ।",
+ "ka_head": "**🤖 क्लोन बॉट ({n}/{max})**\nफीचर: {on}\n\n{items}",
+ "ka_item": "• @{u} — owner `{o}` {st}", "ka_none": "अभी कोई क्लोन नहीं है।",
+ "ka_toggle": "क्लोन फीचर {s}", "kv_text": "**🤖 @{u}**\nID: `{bid}`\nOwner: {owner}\nस्टेटस: {st}\nबना: {when}\nचैट: {nc} | यूज़र: {nu}",
+ "kv_stop": "⏸ बंद करो", "kv_start": "▶️ चालू करो", "kz_ask": "⚠️ क्लोन **@{u}** डिलीट करें? उसका सारा डेटा हट जाएगा।",
 },
 "en": {
  "back": "🔙 Back", "refresh": "🔄 Refresh", "my_chats": "📺 My Chats", "add_chat": "➕ Add Chat",
- "old_help_btn": "ℹ️ Old Requests Help", "plan_btn": "💎 Plan", "lang_btn": "🌐 Language: English",
- "plan_free": "Free", "plan_prem": "Premium ({d} days left)", "plan_prem_owner": "Premium (Admin)",
+ "old_help_btn": "ℹ️ Old Requests Help", "lang_btn": "🌐 Language: English", "myclone_btn": "🤖 Clone Bot",
+ "private_bot": "🔒 This bot is private right now.\nYour ID: `{uid}`",
  "user_main": "**🤖 Auto Join Request Bot**\n\nGet your channel/group join requests approved automatically.\n\n"
               "1️⃣ Make the bot an **admin** in your chat (with \"Invite Users\" permission)\n"
               "2️⃣ The chat is added automatically, or tap ➕ Add Chat\n3️⃣ Change settings in 📺 My Chats\n\n"
-              "💎 Plan: **{plan}** | Chats: {n}/{lim}\nApproved: {tot}",
- "private_bot": "🔒 This bot is private right now.\nYour ID: `{uid}`",
- "banned": "🚫 You have been banned from this bot.",
+              "Your chats: {n} | Approved: {tot}",
+ "admin_main": "**⚙️ Auto Join Request Bot (Admin){tag}**\n\nMode: {mode}\nDelay: {lo}-{hi}s | Queue: {q}\n"
+               "Total approved: {tot}\nHelper session: {hs}\n\n{hint}",
+ "tag_clone": " — Clone", "mode_pub": "🌐 Public", "mode_priv": "🔒 Private",
+ "hint_pub": "In Public mode it's better to keep Auto-all OFF.",
+ "hint_nohelper": "💡 For old pending requests, log in **your own** helper account via 🔑 Old-Req Session.",
+ "b_active": "Bot Active {s}", "b_autoall": "Auto-all chats {s}", "b_wg": "Welcome DM (global) {s}",
+ "b_chats": "📺 Chats", "b_gdelay": "⏱ Delay", "b_gwtext": "👋 Welcome Text", "b_sess": "🔑 Old-Req Session",
+ "b_mode": "Bot Mode: {m} (change)", "b_users": "👥 Users", "b_clones_admin": "🤖 Clones (Admin)",
+ "mode_set_pub": "🌐 The bot is now **Public**: anyone can add their chats.",
+ "mode_set_priv": "🔒 The bot is now **Private**: only the admin can use the panel.\n(Approvals keep running in chats already added.)",
  "chats_hint": "**📺 Chats ({n})**\nTap a chat to open its settings.",
  "add_prompt": "Send the chat ID (`-100...`), @username, or forward any message from the channel/group.\n"
                "The bot must be an admin there, and you must be an admin of that chat too.",
  "chat_text": "**{title}**\n`{cid}`\n\nApprove: {on}\nDelay: {lo}-{hi}s {dt}\nWelcome DM: {w}\n"
-              "🛡 Captcha: {cap}\n📢 Force Subscribe: {fs} channel(s)\n🌐 DM language: {cl}\n"
               "Approved: {ap} | Failed records: {nf}\nOld task: {old}",
  "custom": "(custom)", "global": "(global)", "running": "running ▶️", "idle": "idle",
- "b_approve": "Approve {s}", "b_delay": "⏱ Custom Delay", "b_reset": "♻️ Reset", "b_wdm": "Welcome DM {s}",
- "b_wtext": "✏️ Welcome Text", "b_cap": "🛡 Captcha: {m}{lock}", "b_fs": "📢 Force Subscribe ({n}){lock}",
- "b_cl": "🌐 DM language: {l}", "b_old": "🕰 Approve old requests{lock}", "b_oldstop": "⏹ Stop old approve",
+ "b_approve": "Approve {s}", "b_cdelay": "⏱ Custom Delay", "b_reset": "♻️ Reset", "b_wdm": "Welcome DM {s}",
+ "b_wtext": "✏️ Welcome Text", "b_old": "🕰 Approve old requests", "b_oldstop": "⏹ Stop old approve",
  "b_fail": "❌ Failed Report", "b_help": "ℹ️ Helper info", "b_rm": "🗑 Remove",
- "cap_off": "Off", "cap_human": "Human button", "cap_math": "Math", "lang_hi": "हिंदी", "lang_en": "English",
  "f_title": "**❌ Failed Report — {title}**", "f_none": "✅ No failed request records.",
  "f_total": "Total: {n}", "f_recent": "**Recent:**", "f_check": "🔍 Check one user", "f_clear": "🧹 Clear report",
  "f_ask": "Send the **User ID** (number) you want to check.",
@@ -198,11 +344,7 @@ TX = {
  "old_detail": "\n\nDetails: chat → ❌ Failed Report",
  "old_stopped": "🛑 Stopped `{cid}`. Approved: {ok}",
  "old_err": "❌ Error `{cid}`: {e}",
- "locked": "💎 This is a Premium feature. Tap 💎 Plan to see details.",
- "max_chats": "Your plan allows at most {lim} chats. Get Premium for more (💎 Plan).",
- "plan_text": "**💎 Plan**\n\nYour plan: **{plan}**\n\n**Free**\n• Up to {fc} chats\n• Auto approve, delay, welcome DM, failed report\n\n"
-              "**Premium**\n• Up to {pc} chats\n• 🛡 Captcha (human button / math)\n• 📢 Force Subscribe\n• 🕰 Approve old requests\n\n"
-              "Contact for Premium: {contact}",
+ "old_started": "▶️ Started", "old_nothing": "No task is running.", "old_stopping": "🛑 Stopping...",
  "e_notfound": "Chat not found. First make the bot an admin there, then send the ID/@username or a forwarded message.",
  "e_notadmin_user": "You don't seem to be an admin of this chat.",
  "e_onlyadmin": "Only the chat's admins/owner can add it.",
@@ -211,31 +353,40 @@ TX = {
  "e_bot_noinvite": "Give the bot the \"Invite Users\" (Add Members) permission.",
  "e_delay": "Keep the delay between 1 and 300 seconds.",
  "e_tpl": "Use only {{name}} and {{chat}} in the text (no other {{ }}).",
- "e_nolink": "This channel has no public username and the bot couldn't create an invite link. Give the bot \"Invite Users\" permission.",
+ "max_chats": "One user can add at most {lim} chats.",
  "added": "✅ Added: {title}",
  "member_added": "✅ **{title}** added!{warn}\n\n{note}\n\nFor settings: /settings → 📺 My Chats",
  "warn_noinvite": "\n\n⚠️ The bot lacks \"Invite Users\" permission, so requests won't be approved.",
- "bot_removed": "⚠️ The bot was removed from **{title}**; requests there will no longer be approved.",
- "bot_demoted": "⚠️ The bot's admin rights were removed in **{title}**; requests will no longer be approved.",
  "cd_prompt": "Send this chat's delay: `min max` (e.g. `3 12`)",
  "ce_prompt": "Send the new welcome DM text for this chat. You can use {{name}} and {{chat}}.",
- "saved_w": "✅ This chat's welcome DM saved + ON",
+ "wt_prompt": "Current: `{cur}`\n\nSend the new global welcome text. You can use {{name}} and {{chat}}.",
+ "gd_prompt": "Send the global delay: `min max` (e.g. `2 15`)",
+ "saved_w": "✅ This chat's welcome DM saved + ON", "saved_gw": "✅ Global welcome text saved + ON",
  "q_no_access": "You don't have access to this chat.", "q_owner_only": "This option is admin-only.",
+ "q_main_only": "This feature is only in the main bot.",
  "q_removed": "Removed", "q_clear": "Report cleared", "q_stopping": "Stopping...", "q_started": "Old approve started ▶️",
- "fs_title": "**📢 Force Subscribe — {title}**\n\nUsers must join these channels before their request is approved (max 3). "
-             "The bot must be an **admin** in those channels.\n\n{items}",
- "fs_empty": "No channels added yet.", "fs_add": "➕ Add channel", "fs_max": "You can add at most 3 channels.",
- "fs_ask": "Send the channel's ID, @username, or forward any message from it.",
- "cap_msg_human": "🛡 You sent a join request to **{chat}**.\n\nTap the button below to verify. (within {m} min)",
- "human_btn": "✅ I am human",
- "cap_msg_math": "🛡 You sent a join request to **{chat}**.\n\nPick the correct answer to verify:\n\n**{q} = ?**\n\n(within {m} min)",
- "cap_wrong": "❌ Wrong answer. Here's a new question.",
- "cap_failed": "❌ Verification failed. Your request was cancelled; you can send a new request if you like.",
- "cap_ok": "✅ Verified! Your request is being approved.",
- "gate_expired": "⌛ Time's up. Please send the join request again.",
- "fs_msg": "📢 To get approved in **{chat}**, first join these channels, then tap \"I have joined\".",
- "joined_btn": "✅ I have joined", "not_joined": "You haven't joined all the channels yet.",
- "fs_ok": "✅ Great! Your request is being approved.",
+ "in_err": "❌ Invalid input", "in_err_full": "❌ {d}\nSend again or press /settings.",
+ "ses_in": "**🔑 Old-Request Session**\n\nLogged in: {who} (`{hid}`) ✅\n\nThis account must be an **admin** in every chat (Invite Users). "
+           "The bot shows these details to users itself.",
+ "ses_out": "**🔑 Old-Request Session**\n\nNo session yet ❌\nFor old pending requests, log in a user account "
+            "(better: a separate/secondary account).",
+ "ses_clone_note": "\n\n🤖 **Rules for clone bots:** this is your clone's **own** helper account, not the main bot's. "
+                   "Please log in with your own Telegram account (preferably a separate one) yourself, then make it an admin in your chats. "
+                   "Do not use anyone else's account or session without their permission.",
+ "b_login": "📲 Login (Phone + OTP)", "b_paste": "📋 Paste Session String", "b_logout": "🚪 Logout / Remove",
+ "ses_phone": "📲 Send the helper account's phone number with country code, e.g. `+919876543210`",
+ "ses_str": "📋 Paste the Pyrogram SESSION_STRING (the message will be deleted right away).",
+ "ses_otp": "📨 Telegram sent an OTP to that account.\n\nSend the code **with spaces**, like `1 2 3 4 5` "
+            "(if sent directly, Telegram blocks the code).",
+ "ses_2fa": "🔐 Send your 2-step verification password (the message will be deleted).",
+ "ses_ok": "✅ Logged in! The session is saved.", "ses_set": "✅ Session set.", "ses_bye": "Logged out",
+ "ses_fail": "❌ {err}\nPress the Login button again.",
+ "u_head": "**👥 Users**\nTotal: {total} | New (24h): {new24} | Active (24h): {act24}\nPage {p}/{pages}\n\n",
+ "u_entry": "**{i}.** {crown}{who}\n   {uname} | ID: `{uid}`\n   Start: {st}\n   Last: {last}\n   Chats: {nc} | Approved: {ap}",
+ "u_none": "No user records yet.", "no_username": "no username",
+ "nav_back": "⬅️ Back", "nav_next": "Next ➡️", "b_menu": "🔙 Menu",
+ "dl_title": "**⏱ Global Delay**\nCurrent: {lo}-{hi}s", "b_custom": "✏️ Custom",
+ "ping_full": "🏓 pong\n{mongo}\nHelper session: {h}\nMode: {mode}\nClones: {nc}",
  "r_USER_CHANNELS_TOO_MUCH": "The user is at Telegram's 500 channels/groups limit, so they can't join any more. (Nothing can be done)",
  "r_USER_DEACTIVATED": "Account is deleted/deactivated.",
  "r_USER_DEACTIVATED_BAN": "Account was banned by Telegram.",
@@ -245,18 +396,49 @@ TX = {
  "r_USER_PRIVACY_RESTRICTED": "Can't be added because of the user's privacy settings.",
  "r_USER_ID_INVALID": "User not found (deleted/invalid).",
  "r_CHAT_ADMIN_REQUIRED": "Missing admin permission. Give \"Invite Users\" permission.",
- "r_CAPTCHA_DM_FAILED": "The captcha message couldn't be delivered to the user.",
- "r_CAPTCHA_FAILED": "3 wrong captcha answers, request cancelled.",
- "r_GATE_TIMEOUT": "The user didn't verify/join in time, request cancelled.",
  "r_unknown": "Unknown reason: {rid}",
- "prem_got": "💎 You've got **Premium**: {d} days.\nNew features: Captcha, Force Subscribe, old requests approve.",
- "prem_end": "⌛ Your Premium has ended. Premium features are now off. See 💎 Plan to renew.",
+ # ---- clone
+ "k_rules": "**🤖 Clone Bot — your own bot**\n\nFrom here you can create **your own bot** just like this one, and you will be its admin. Rules:\n\n"
+            "1️⃣ Create a new bot with @BotFather → /newbot and send its **token** here.\n"
+            "2️⃣ Your clone's data (chats, settings, users) stays **completely separate** from the main bot.\n"
+            "3️⃣ The clone has the same commands and panels that the admin has in this bot.\n"
+            "4️⃣ For old pending requests you must log in **your own** helper account inside the clone "
+            "(⚙️ Settings → 🔑 Old-Req Session) and make it an admin in your chats.\n"
+            "5️⃣ One account can have **only one** clone, and you can delete it any time.\n"
+            "6️⃣ Never share your token. Your token and session are stored encrypted.",
+ "k_have": "**🤖 Your Clone Bot**\n\nBot: @{u}\nStatus: {st}\nCreated: {when}\n\nYou are its admin. The commands/panels are the same as the admin has in this bot. "
+           "For old requests, please log in your own helper account inside the clone.",
+ "k_st_run": "running ✅", "k_st_stop": "stopped ⏸",
+ "k_open": "🔗 Open @{u}", "k_new": "➕ Create clone", "k_restart": "🔄 Restart", "k_del": "🗑 Delete clone",
+ "k_yes": "✅ Yes, delete", "k_no": "❌ No",
+ "k_ask_token": "Send your new bot's **token** (you get it from @BotFather → /newbot).\n\n⚠️ Never share the token. I will delete this message right away.",
+ "k_badtoken": "The token format is wrong. Send the full token from @BotFather (like `123456:ABC...`).",
+ "k_same": "That is this (main) bot's own token. Create your own new bot and send its token.",
+ "k_dup": "A clone already exists for this token.",
+ "k_one": "You already have a clone. Delete it first to create a new one.",
+ "k_full": "The clone limit is currently full. Please try again later.",
+ "k_off": "The clone feature is currently off.",
+ "k_invalid": "The bot couldn't start with this token. Check that the token is correct and active, then send it again.",
+ "k_wait": "⏳ Starting your clone...",
+ "k_done": "✅ Your clone bot is ready: @{u}\n\n1️⃣ Open @{u} and press /start — you are the **admin** there.\n"
+           "2️⃣ Its commands/panels are the same as the admin has in this bot.\n"
+           "3️⃣ For old pending requests, in the clone go to ⚙️ Settings → 🔑 Old-Req Session and log in **your own** helper account "
+           "(preferably a separate one), then make it an admin in your chats.\n"
+           "4️⃣ One account can have only one clone; you can delete it any time with 🗑.",
+ "k_deleted": "🗑 The clone is deleted and all its data removed. You may also delete the bot / revoke its token in @BotFather.",
+ "k_del_ask": "⚠️ Do you really want to delete your clone **@{u}**? All its chats/settings/users data will be removed permanently.",
+ "k_restarted": "🔄 Clone restarted.",
+ "k_admin_removed": "⚠️ Your clone bot was removed by the admin.",
+ "k_failed_boot": "⚠️ Your clone **@{u}** couldn't start (was the token changed/revoked?). Create it again from 🤖 Clone Bot.",
+ "ka_head": "**🤖 Clone Bots ({n}/{max})**\nFeature: {on}\n\n{items}",
+ "ka_item": "• @{u} — owner `{o}` {st}", "ka_none": "No clones yet.",
+ "ka_toggle": "Clone feature {s}", "kv_text": "**🤖 @{u}**\nID: `{bid}`\nOwner: {owner}\nStatus: {st}\nCreated: {when}\nChats: {nc} | Users: {nu}",
+ "kv_stop": "⏸ Stop", "kv_start": "▶️ Start", "kz_ask": "⚠️ Delete clone **@{u}**? All its data will be removed.",
 },
 }
 REASON_EMOJI = {"USER_CHANNELS_TOO_MUCH": "🚫", "USER_DEACTIVATED": "👻", "USER_DEACTIVATED_BAN": "⛔",
                 "HIDE_REQUESTER_MISSING": "↩️", "USER_ALREADY_PARTICIPANT": "✔️", "USER_BANNED_IN_CHANNEL": "🔨",
-                "USER_PRIVACY_RESTRICTED": "🔒", "USER_ID_INVALID": "❓", "CHAT_ADMIN_REQUIRED": "🔑",
-                "CAPTCHA_DM_FAILED": "📭", "CAPTCHA_FAILED": "🛡", "GATE_TIMEOUT": "⌛"}
+                "USER_PRIVACY_RESTRICTED": "🔒", "USER_ID_INVALID": "❓", "CHAT_ADMIN_REQUIRED": "🔑"}
 REASON_ALIAS = {"INPUT_USER_DEACTIVATED": "USER_DEACTIVATED", "PEER_ID_INVALID": "USER_ID_INVALID"}
 
 def tx(lang, key, **kw):
@@ -292,32 +474,17 @@ def helper_note(lang="hi"):
     return tx(lang, "helper_note", who=mention(helper["name"], helper["id"]), uname=uname, hid=helper["id"])
 
 
-def _owner(_, __, m):
-    return bool(m.from_user) and m.from_user.id in OWNERS
-def _user(_, __, m):
-    if not m.from_user or m.from_user.id in BANNED:
-        return False
-    return m.from_user.id in OWNERS or STATE["public"]
+# ---- filters: client se pata chalta hai ki ye main hai ya kaunsa clone
+def _inst_of(client):
+    return INSTANCES[client.name]
+def _owner(_, client, m):
+    return bool(m.from_user) and m.from_user.id in _inst_of(client).owners
+def _user(_, client, m):
+    i = _inst_of(client)
+    return bool(m.from_user) and (m.from_user.id in i.owners or i.state["public"])
 is_owner = filters.create(_owner)
 is_user = filters.create(_user)
 
-
-# ======================= logging / alerts =======================
-async def notify_admin(text: str, important: bool = False):
-    """Log channel me bhejta hai; important ho aur log channel na ho/fail ho to owners ko DM."""
-    sent = False
-    if LOG["chat"]:
-        try:
-            await bot.send_message(LOG["chat"], text)
-            sent = True
-        except Exception as e:
-            log.warning("log channel send fail: %s", e)
-    if important and not sent:
-        for oid in OWNERS:
-            try:
-                await bot.send_message(oid, text)
-            except Exception:
-                pass
 
 def safe(fn):
     @functools.wraps(fn)
@@ -326,14 +493,13 @@ def safe(fn):
             return await fn(client, update, *a, **k)
         except Exception as e:
             target = update.message if isinstance(update, CallbackQuery) else update
-            uid = update.from_user.id if getattr(update, "from_user", None) else 0
             if isinstance(e, UserError):
                 text = f"❌ {e}"
             else:
                 log.exception("handler error in %s", fn.__name__)
+                uid = update.from_user.id if getattr(update, "from_user", None) else 0
                 text = (f"❌ **Error** (`{fn.__name__}`)\n`{type(e).__name__}: {str(e)[:600]}`"
-                        if uid in OWNERS else "❌ Something went wrong / कुछ गड़बड़ हुई, try again later.")
-                await notify_admin(f"⚠️ Error in `{fn.__name__}` (user `{uid}`)\n`{type(e).__name__}: {str(e)[:300]}`", important=True)
+                        if uid in OWNERS else "❌ Something went wrong / कुछ गड़बड़ हुई. Try again later.")
             try:
                 await target.reply(text)
             except Exception:
@@ -341,7 +507,7 @@ def safe(fn):
     return w
 
 
-# ======================= settings / users / plans =======================
+# ======================= settings helpers =======================
 async def gcfg() -> dict:
     return {**DEFAULTS, **(await db.settings.find_one({"_id": "global"}) or {})}
 
@@ -361,45 +527,6 @@ async def lang_of(uid: int) -> str:
 async def set_lang(uid: int, lang: str):
     LANG[uid] = lang
     await db.users.update_one({"_id": uid}, {"$set": {"lang": lang}}, upsert=True)
-
-async def is_premium(uid) -> bool:
-    if uid is None or uid in OWNERS:
-        return True
-    u = await db.users.find_one({"_id": uid})
-    return bool(u) and u.get("premium_until", 0) > time.time()
-
-async def plan_status(uid: int):
-    """(premium?, bache din)"""
-    if uid in OWNERS:
-        return True, 0
-    u = await db.users.find_one({"_id": uid}) or {}
-    left = u.get("premium_until", 0) - time.time()
-    return (left > 0), max(0, math.ceil(left / 86400))
-
-async def max_chats(uid: int) -> int:
-    if uid in OWNERS:
-        return 10 ** 6
-    return PREMIUM_CHATS if await is_premium(uid) else FREE_CHATS
-
-async def chat_is_premium(c: dict) -> bool:
-    return await is_premium(c.get("owner_id"))
-
-async def set_premium(uid: int, days: int):
-    now = time.time()
-    if days <= 0:
-        await db.users.update_one({"_id": uid}, {"$unset": {"premium_until": ""}, "$set": {"exp_notified": True}}, upsert=True)
-        return None
-    u = await db.users.find_one({"_id": uid}) or {}
-    until = max(now, u.get("premium_until", 0)) + days * 86400
-    await db.users.update_one({"_id": uid}, {"$set": {"premium_until": until, "exp_notified": False}}, upsert=True)
-    return until
-
-async def set_ban(uid: int, flag: bool):
-    if flag:
-        BANNED.add(uid)
-    else:
-        BANNED.discard(uid)
-    await db.users.update_one({"_id": uid}, {"$set": {"banned": flag}}, upsert=True)
 
 def welcome_of(c: dict, g: dict):
     """Per-chat welcome. User ke chat par owner ka global welcome kabhi nahi jata."""
@@ -421,16 +548,9 @@ async def effective(cid: int):
         c = {}
     if c.get("enabled", True) is False:
         return None
-    oid = c.get("owner_id")
-    if oid is not None and oid in BANNED:
-        return None
-    prem = await is_premium(oid)       # Premium khatam => captcha/force-sub apne-aap band
     w_on, w_text = welcome_of(c, g)
     return {"min": c.get("min", g["min"]), "max": c.get("max", g["max"]),
-            "welcome_on": w_on, "welcome": w_text,
-            "captcha": c.get("captcha", "off") if prem else "off",
-            "fsub": c.get("fsub", []) if prem else [],
-            "lang": c.get("lang", "hi")}
+            "welcome_on": w_on, "welcome": w_text}
 
 async def can_manage(uid: int, cid: int) -> bool:
     if uid in OWNERS:
@@ -453,201 +573,34 @@ async def record_fail(cid, uid, name, username, rid, src):
     except Exception:
         log.exception("record_fail")
 
-async def clear_fail(cid, uid):
-    try:
-        await db.fails.delete_one({"_id": f"{cid}:{uid}"})
-    except Exception:
-        pass
-
 async def touch_user(u):
     """Bot se baat karne wale har user ka record (sirf admin dekh sakta hai)."""
     if not u or getattr(u, "is_bot", False):
         return
     now = time.time()
     try:
-        res = await db.users.update_one(
+        await db.users.update_one(
             {"_id": u.id},
             {"$set": {"first_name": u.first_name, "last_name": u.last_name, "username": u.username, "last_seen": now},
              "$setOnInsert": {"started": now}}, upsert=True)
-        if getattr(res, "upserted_id", None) is not None:
-            name = " ".join(x for x in (u.first_name, u.last_name) if x) or "NoName"
-            await notify_admin(f"👤 Naya user: {mention(name, u.id)} "
-                               f"{('@' + u.username) if u.username else ''} `{u.id}`")
     except Exception:
         log.exception("touch_user")
 
-
-# ======================= gates: captcha + force-subscribe =======================
-def make_math():
-    a, b = random.randint(2, 9), random.randint(1, 9)
-    if random.random() < 0.5:
-        ans, q = a + b, f"{a} + {b}"
-    else:
-        a, b = max(a, b), min(a, b)
-        ans, q = a - b, f"{a} - {b}"
-    opts = {ans}
-    while len(opts) < 4:
-        opts.add(max(0, ans + random.choice([-3, -2, -1, 1, 2, 3, 4])))
-    opts = list(opts)
-    random.shuffle(opts)
-    return q, ans, opts
-
-async def fsub_missing(entries: list, uid: int) -> list:
-    out = []
-    for e in entries:
-        try:
-            m = await bot.get_chat_member(e["id"], uid)
-            if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
-                out.append(e)
-        except Exception as ex:
-            if reason_of(ex) == "USER_NOT_PARTICIPANT" or type(ex).__name__ == "UserNotParticipant":
-                out.append(e)
-            else:  # check nahi ho paya (bot admin nahi?) => user ko mat rokna
-                log.warning("fsub check fail %s: %s", e.get("id"), ex)
-    return out
-
-async def start_gates(cid, title, uid, name, uname, cfg):
-    if cfg["captcha"] != "off":
-        return await send_captcha(cid, title, uid, name, uname, cfg)
-    if cfg["fsub"]:
-        return await send_fsub(cid, title, uid, name, uname, cfg)
-    await queue.put((cid, title, uid, name, uname, cfg))
-
-async def gate_fail(cid, uid, name, uname, rid, decline=True):
-    await db.gate.delete_one({"_id": f"{cid}:{uid}"})
-    if decline:
-        try:
-            await bot.decline_chat_join_request(cid, uid)
-        except Exception:
-            pass
-    await record_fail(cid, uid, name, uname, rid, "new")
-
-async def send_captcha(cid, title, uid, name, uname, cfg, edit=None):
-    lang, mode = cfg["lang"], cfg["captcha"]
-    doc = {"chat_id": cid, "user_id": uid, "name": name, "username": uname, "title": title,
-           "stage": "captcha", "tries": 0, "ts": time.time()}
-    if mode == "math":
-        q, ans, opts = make_math()
-        doc["ans"] = ans
-        text = tx(lang, "cap_msg_math", chat=clean(title), q=q, m=GATE_MINUTES)
-        kb = [[B(str(o), callback_data=f"hm:{cid}:{o}") for o in opts]]
-    else:
-        text = tx(lang, "cap_msg_human", chat=clean(title), m=GATE_MINUTES)
-        kb = [[B(tx(lang, "human_btn"), callback_data=f"hv:{cid}")]]
-    await db.gate.update_one({"_id": f"{cid}:{uid}"}, {"$set": doc}, upsert=True)
+async def clear_fail(cid, uid):
     try:
-        if edit is not None:
-            await edit.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup(kb))
-    except Exception as e:
-        log.warning("captcha dm fail %s/%s: %s", cid, uid, e)
-        await db.gate.delete_one({"_id": f"{cid}:{uid}"})
-        await record_fail(cid, uid, name, uname, "CAPTCHA_DM_FAILED", "new")
-
-async def send_fsub(cid, title, uid, name, uname, cfg, edit=None):
-    lang = cfg["lang"]
-    missing = await fsub_missing(cfg["fsub"], uid)
-    if not missing:
-        await db.gate.delete_one({"_id": f"{cid}:{uid}"})
-        if edit is not None:
-            try:
-                await edit.edit_text(tx(lang, "cap_ok"))
-            except Exception:
-                pass
-        await queue.put((cid, title, uid, name, uname, cfg))
-        return
-    doc = {"chat_id": cid, "user_id": uid, "name": name, "username": uname, "title": title,
-           "stage": "fsub", "tries": 0, "ts": time.time()}
-    await db.gate.update_one({"_id": f"{cid}:{uid}"}, {"$set": doc}, upsert=True)
-    kb = [[B(f"📢 {e.get('title') or e['id']}"[:60], url=e["link"])] for e in missing]
-    kb.append([B(tx(lang, "joined_btn"), callback_data=f"hf:{cid}")])
-    text = tx(lang, "fs_msg", chat=clean(title))
-    try:
-        if edit is not None:
-            await edit.edit_text(text, reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup(kb))
-    except Exception as e:
-        log.warning("fsub dm fail %s/%s: %s", cid, uid, e)
-        await db.gate.delete_one({"_id": f"{cid}:{uid}"})
-        await record_fail(cid, uid, name, uname, "CAPTCHA_DM_FAILED", "new")
-
-@bot.on_callback_query(filters.regex(r"^h[vmf]:"))
-@safe
-async def gate_cb(_, q: CallbackQuery):
-    """Join-request karne wale user ke buttons (captcha / force-sub). Sab ke liye khula."""
-    act, _, rest = q.data.partition(":")
-    parts = rest.split(":")
-    cid, uid = int(parts[0]), q.from_user.id
-    key = f"{cid}:{uid}"
-    g = await db.gate.find_one({"_id": key})
-    cfg = await effective(cid)
-    lang = (cfg or {}).get("lang", "hi")
-    if not g or cfg is None or time.time() - g["ts"] > GATE_MINUTES * 60:
-        await db.gate.delete_one({"_id": key})
-        return await q.answer(tx(lang, "gate_expired"), show_alert=True)
-    name, uname, title = g.get("name"), g.get("username"), g.get("title")
-
-    async def finish():
-        """Captcha pass => agar force-sub hai to wo, warna approve."""
-        if cfg["fsub"]:
-            return await send_fsub(cid, title, uid, name, uname, cfg, edit=q.message)
-        await db.gate.delete_one({"_id": key})
-        await queue.put((cid, title, uid, name, uname, cfg))
-        try:
-            await q.message.edit_text(tx(lang, "cap_ok"))
-        except Exception:
-            pass
-
-    if act == "hv" and g["stage"] == "captcha":
-        await q.answer()
-        return await finish()
-    if act == "hm" and g["stage"] == "captcha":
-        if int(parts[1]) == g.get("ans"):
-            await q.answer()
-            return await finish()
-        tries = g.get("tries", 0) + 1
-        if tries >= 3:
-            await gate_fail(cid, uid, name, uname, "CAPTCHA_FAILED")
-            await q.answer()
-            try:
-                await q.message.edit_text(tx(lang, "cap_failed"))
-            except Exception:
-                pass
-            return
-        await q.answer(tx(lang, "cap_wrong"), show_alert=True)
-        qq, ans, opts = make_math()
-        await db.gate.update_one({"_id": key}, {"$set": {"ans": ans, "tries": tries}})
-        kb = [[B(str(o), callback_data=f"hm:{cid}:{o}") for o in opts]]
-        try:
-            await q.message.edit_text(tx(lang, "cap_msg_math", chat=clean(title), q=qq, m=GATE_MINUTES),
-                                      reply_markup=InlineKeyboardMarkup(kb))
-        except Exception:
-            pass
-        return
-    if act == "hf" and g["stage"] == "fsub":
-        if await fsub_missing(cfg["fsub"], uid):
-            return await q.answer(tx(lang, "not_joined"), show_alert=True)
-        await q.answer()
-        await db.gate.delete_one({"_id": key})
-        await queue.put((cid, title, uid, name, uname, cfg))
-        try:
-            await q.message.edit_text(tx(lang, "fs_ok"))
-        except Exception:
-            pass
-        return
-    await q.answer(tx(lang, "gate_expired"), show_alert=True)
+        await db.fails.delete_one({"_id": f"{cid}:{uid}"})
+    except Exception:
+        pass
 
 
 # ======================= new requests =======================
-@bot.on_chat_join_request()
+@on_join_request()
 async def on_request(_, r: ChatJoinRequest):
     cfg = await effective(r.chat.id)
     if cfg is None:
         return
     await db.chats.update_one({"_id": r.chat.id}, {"$setOnInsert": {"title": r.chat.title}}, upsert=True)
-    await start_gates(r.chat.id, r.chat.title, r.from_user.id, r.from_user.first_name, r.from_user.username, cfg)
+    await queue.put((r.chat.id, r.chat.title, r.from_user.id, r.from_user.first_name, r.from_user.username, cfg))
 
 async def worker():
     while True:
@@ -678,36 +631,30 @@ async def worker():
 
 # ======================= helper (user) account =======================
 async def stop_user():
-    global user, helper
-    for t in list(old_tasks.values()):
+    inst = CUR.get()
+    for t in list(inst.old_tasks.values()):
         t.cancel()
-    if user:
+    if inst.user:
         try:
-            await user.stop()
+            await inst.user.stop()
         except Exception:
             pass
-    user, helper = None, None
+    inst.user, inst.helper = None, None
 
 async def start_user(sess: str):
-    global user, helper
+    inst = CUR.get()
     await stop_user()
-    c = Client("user", api_id=API_ID, api_hash=API_HASH, session_string=sess, in_memory=True)
+    c = Client(f"user_{inst.key}", api_id=API_ID, api_hash=API_HASH, session_string=sess, in_memory=True)
     await c.start()
     me = await c.get_me()
-    user = c
-    helper = {"id": me.id, "name": me.first_name or "Helper", "username": me.username}
+    inst.user = c
+    inst.helper = {"id": me.id, "name": me.first_name or "Helper", "username": me.username}
 
 async def load_user():
     doc = await db.settings.find_one({"_id": "session"})
-    sess = (doc or {}).get("string") or SESSION_STRING
+    sess = dec((doc or {}).get("string")) or (SESSION_STRING if CUR.get().key == "main" else None)
     if sess:
         await start_user(sess)
-
-async def helper_died(why: str):
-    await stop_user()
-    await db.settings.delete_one({"_id": "session"})
-    await notify_admin(f"🚨 Helper session band ho gaya: `{why}`\nPurani requests tab tak nahi chalengi jab tak "
-                       "/settings → 🔑 Old-Req Session se dobara login na karo.", important=True)
 
 async def ensure_peer(cid: int) -> bool:
     try:
@@ -766,7 +713,7 @@ async def approve_old(cid: int, notify: int):
             await bot.send_message(notify, tx(lang, "old_queue"))
         async with old_sem:
             if not await ensure_peer(cid):
-                raise RuntimeError("Helper account is chat ka member nahi hai")
+                raise RuntimeError("Helper account is not a member of this chat")
             async for req in user.get_chat_join_requests(cid):
                 u = req.user
                 while True:
@@ -780,8 +727,6 @@ async def approve_old(cid: int, notify: int):
                         await asyncio.sleep(e.value + 1)
                     except Exception as e:
                         rid = reason_of(e)
-                        if rid in AUTH_DEAD:
-                            raise
                         fails[rid] += 1
                         await record_fail(cid, u.id, u.first_name, u.username, rid, "old")
                         break
@@ -795,8 +740,6 @@ async def approve_old(cid: int, notify: int):
     except asyncio.CancelledError:
         await bot.send_message(notify, tx(lang, "old_stopped", cid=cid, ok=done))
     except Exception as e:
-        if reason_of(e) in AUTH_DEAD:
-            await helper_died(reason_of(e))
         await bot.send_message(notify, tx(lang, "old_err", cid=cid, e=f"{type(e).__name__}: {e}"))
     finally:
         old_tasks.pop(cid, None)
@@ -818,15 +761,18 @@ async def try_delete(m: Message):
     except Exception:
         pass
 
-async def finish_login(m: Message, uid: int):
+async def save_session(sess: str):
+    await db.settings.update_one({"_id": "session"}, {"$set": {"string": enc(sess)}}, upsert=True)
+
+async def finish_login(m: Message, uid: int, lang: str):
     lg = logins.pop(uid)
     sess = await lg["c"].export_session_string()
     await lg["c"].disconnect()
     pending.pop(uid, None)
-    await db.settings.update_one({"_id": "session"}, {"$set": {"string": sess}}, upsert=True)
+    await save_session(sess)
     await start_user(sess)
-    await m.reply("✅ Login ho gaya! Session save ho gaya, Render me kuch badalna nahi hai.")
-    await show(m, *await session_panel())
+    await m.reply(tx(lang, "ses_ok"))
+    await show(m, *await session_panel(uid))
 
 
 # ======================= panels =======================
@@ -844,41 +790,33 @@ async def main_panel(uid: int):
     lang = await lang_of(uid)
     if uid in OWNERS:
         pub = STATE["public"]
-        text = (f"**⚙️ Auto Join Request Bot (Admin)**\n\n"
-                f"Mode: {'🌐 Public' if pub else '🔒 Private'}\n"
-                f"Delay: {g['min']}-{g['max']}s | Queue: {queue.qsize()}\n"
-                f"Total approved: {g.get('total', 0)}\n"
-                f"Helper session: {'✅ ' + clean(helper['name']) if helper else '❌'}\n"
-                f"Log channel: {'✅' if LOG['chat'] else '❌'} | Banned: {len(BANNED)}\n\n"
-                "Public mode me Auto-all OFF rakhna behtar hai.")
-        kb = [[B(f"Bot Active {tick(g['active'])}", callback_data="g:active")],
-              [B(f"Auto-all chats {tick(g['auto_all'])}", callback_data="g:auto_all")],
-              [B(f"Welcome DM (global) {tick(g['welcome_on'])}", callback_data="g:welcome_on")],
-              [B("📺 Chats", callback_data="chats"), B("⏱ Delay", callback_data="delay")],
-              [B("👋 Welcome Text", callback_data="wt"), B("🔑 Old-Req Session", callback_data="ses")],
-              [B("📣 Log Channel", callback_data="lgp"), B(tx(lang, "lang_btn"), callback_data="lang")],
-              [B(f"Bot Mode: {'🌐 Public' if pub else '🔒 Private'} (badlo)", callback_data="pub")],
-              [B("👥 Users", callback_data="us:0"), B("🔄 Refresh", callback_data="main")]]
+        hs = ("✅ " + clean(helper["name"])) if helper else "❌"
+        hint = tx(lang, "hint_pub") if (helper or not IS_CLONE) else tx(lang, "hint_nohelper")
+        text = tx(lang, "admin_main", tag=tx(lang, "tag_clone") if IS_CLONE else "",
+                  mode=tx(lang, "mode_pub" if pub else "mode_priv"), lo=g["min"], hi=g["max"],
+                  q=queue.qsize(), tot=g.get("total", 0), hs=hs, hint=hint)
+        kb = [[B(tx(lang, "b_active", s=tick(g["active"])), callback_data="g:active")],
+              [B(tx(lang, "b_autoall", s=tick(g["auto_all"])), callback_data="g:auto_all")],
+              [B(tx(lang, "b_wg", s=tick(g["welcome_on"])), callback_data="g:welcome_on")],
+              [B(tx(lang, "b_chats"), callback_data="chats"), B(tx(lang, "b_gdelay"), callback_data="delay")],
+              [B(tx(lang, "b_gwtext"), callback_data="wt"), B(tx(lang, "b_sess"), callback_data="ses")],
+              [B(tx(lang, "b_mode", m=tx(lang, "mode_pub" if pub else "mode_priv")), callback_data="pub")],
+              [B(tx(lang, "b_users"), callback_data="us:0"), B(tx(lang, "lang_btn"), callback_data="lang")]]
+        if not IS_CLONE:
+            kb.append([B(tx(lang, "myclone_btn"), callback_data="k"), B(tx(lang, "b_clones_admin"), callback_data="ka:0")])
+        kb.append([B(tx(lang, "refresh"), callback_data="main")])
     else:
         n, tot = 0, 0
         async for c in db.chats.find({"owner_id": uid}):
             n += 1
             tot += c.get("approved", 0)
-        prem, left = await plan_status(uid)
-        plan = tx(lang, "plan_prem", d=left) if prem else tx(lang, "plan_free")
-        text = tx(lang, "user_main", plan=plan, n=n, lim=await max_chats(uid), tot=tot)
+        text = tx(lang, "user_main", n=n, tot=tot)
         kb = [[B(tx(lang, "my_chats"), callback_data="chats"), B(tx(lang, "add_chat"), callback_data="add")],
-              [B(tx(lang, "plan_btn"), callback_data="plan"), B(tx(lang, "old_help_btn"), callback_data="oh")],
-              [B(tx(lang, "lang_btn"), callback_data="lang"), B(tx(lang, "refresh"), callback_data="main")]]
+              [B(tx(lang, "old_help_btn"), callback_data="oh")]]
+        if not IS_CLONE:
+            kb.append([B(tx(lang, "myclone_btn"), callback_data="k")])
+        kb.append([B(tx(lang, "lang_btn"), callback_data="lang"), B(tx(lang, "refresh"), callback_data="main")])
     return text, InlineKeyboardMarkup(kb)
-
-async def plan_panel(uid: int):
-    lang = await lang_of(uid)
-    prem, left = await plan_status(uid)
-    plan = tx(lang, "plan_prem_owner") if uid in OWNERS else (tx(lang, "plan_prem", d=left) if prem else tx(lang, "plan_free"))
-    contact = ADMIN_CONTACT or (mention("Admin", sorted(OWNERS)[0]) if OWNERS else "-")
-    return (tx(lang, "plan_text", plan=plan, fc=FREE_CHATS, pc=PREMIUM_CHATS, contact=contact),
-            InlineKeyboardMarkup([[B(tx(lang, "back"), callback_data="main")]]))
 
 async def chats_panel(uid: int, page=0):
     lang = await lang_of(uid)
@@ -900,42 +838,23 @@ async def chats_panel(uid: int, page=0):
 async def chat_panel(cid: int, uid: int):
     lang = await lang_of(uid)
     c, g = await ccfg(cid) or {}, await gcfg()
-    prem = await chat_is_premium(c)
-    lock = "" if prem else " 💎"
     on = c.get("enabled", True)
     lo, hi = c.get("min", g["min"]), c.get("max", g["max"])
     w_on, _w = welcome_of(c, g)
     running = cid in old_tasks
     nfail = await db.fails.count_documents({"chat_id": cid})
-    cap = c.get("captcha", "off")
-    cl = c.get("lang", "hi")
-    fs_n = len(c.get("fsub", []))
     text = tx(lang, "chat_text", title=clean(c.get("title", cid)), cid=cid, on=tick(on), lo=lo, hi=hi,
               dt=tx(lang, "custom") if "min" in c else tx(lang, "global"), w=tick(w_on),
-              cap=tx(lang, f"cap_{cap}") + lock, fs=fs_n, cl=tx(lang, f"lang_{cl}"),
               ap=c.get("approved", 0), nf=nfail, old=tx(lang, "running") if running else tx(lang, "idle"))
     kb = InlineKeyboardMarkup([
         [B(tx(lang, "b_approve", s=tick(on)), callback_data=f"ct:{cid}")],
-        [B(tx(lang, "b_delay"), callback_data=f"cd:{cid}"), B(tx(lang, "b_reset"), callback_data=f"cr:{cid}")],
+        [B(tx(lang, "b_cdelay"), callback_data=f"cd:{cid}"), B(tx(lang, "b_reset"), callback_data=f"cr:{cid}")],
         [B(tx(lang, "b_wdm", s=tick(w_on)), callback_data=f"cw:{cid}"), B(tx(lang, "b_wtext"), callback_data=f"ce:{cid}")],
-        [B(tx(lang, "b_cap", m=tx(lang, f"cap_{cap}"), lock=lock), callback_data=f"cc:{cid}")],
-        [B(tx(lang, "b_fs", n=fs_n, lock=lock), callback_data=f"fs:{cid}")],
-        [B(tx(lang, "b_cl", l=tx(lang, f"lang_{cl}")), callback_data=f"cl:{cid}")],
         [B(tx(lang, "b_oldstop"), callback_data=f"cs:{cid}") if running
-         else B(tx(lang, "b_old", lock=lock), callback_data=f"co:{cid}")],
+         else B(tx(lang, "b_old"), callback_data=f"co:{cid}")],
         [B(tx(lang, "b_fail"), callback_data=f"fr:{cid}"), B(tx(lang, "b_help"), callback_data="oh")],
         [B(tx(lang, "b_rm"), callback_data=f"cx:{cid}"), B(tx(lang, "back"), callback_data="chats")]])
     return text, kb
-
-async def fsub_panel(cid: int, uid: int):
-    lang = await lang_of(uid)
-    c = await ccfg(cid) or {}
-    ents = c.get("fsub", [])
-    items = "\n".join(f"{i + 1}. {clean(e.get('title') or e['id'])} (`{e['id']}`)" for i, e in enumerate(ents)) or tx(lang, "fs_empty")
-    rows = [[B(f"🗑 {clean(e.get('title') or e['id'])[:30]}", callback_data=f"fd:{cid}:{i}")] for i, e in enumerate(ents)]
-    rows.append([B(tx(lang, "fs_add"), callback_data=f"fa:{cid}")])
-    rows.append([B(tx(lang, "back"), callback_data=f"c:{cid}")])
-    return tx(lang, "fs_title", title=clean(c.get("title", cid)), items=items), InlineKeyboardMarkup(rows)
 
 async def fails_panel(cid: int, uid: int):
     lang = await lang_of(uid)
@@ -958,44 +877,10 @@ async def fails_panel(cid: int, uid: int):
         [B(tx(lang, "back"), callback_data=f"c:{cid}")]])
     return text, kb
 
-async def delay_panel():
-    g = await gcfg()
-    kb = InlineKeyboardMarkup([
-        [B("🚀 Fast 1-5s", callback_data="dp:1:5"), B("🙂 Normal 2-15s", callback_data="dp:2:15")],
-        [B("🐢 Slow 10-40s", callback_data="dp:10:40"), B("✏️ Custom", callback_data="dc")],
-        [B("🔙 Back", callback_data="main")]])
-    return f"**⏱ Global Delay**\nAbhi: {g['min']}-{g['max']}s", kb
-
-async def session_panel():
-    if user:
-        text = (f"**🔑 Old-Request Session**\n\nLogged in: {mention(helper['name'], helper['id'])} (`{helper['id']}`) ✅\n\n"
-                "Ye account har chat me **admin** hona chahiye (Invite Users). Users ko bot ye details khud dikhata hai.")
-        rows = [[B("🚪 Logout / Remove", callback_data="lo")], [B("🔙 Back", callback_data="main")]]
-    else:
-        text = ("**🔑 Old-Request Session**\n\nAbhi koi session nahi hai ❌\n"
-                "Purani pending requests ke liye ek user account login karo (better: alag/secondary account).")
-        rows = [[B("📲 Login (Phone + OTP)", callback_data="lg")],
-                [B("📋 Paste Session String", callback_data="ls")],
-                [B("🔙 Back", callback_data="main")]]
-    return text, InlineKeyboardMarkup(rows)
-
-async def helper_panel(uid: int):
-    lang = await lang_of(uid)
-    return (helper_note(lang) + tx(lang, "helper_tail"),
-            InlineKeyboardMarkup([[B(tx(lang, "back"), callback_data="main")]]))
-
-def log_panel():
-    text = ("**📣 Log Channel**\n\nNaye users, naye chats, Premium/ban changes aur errors yahan aate hain.\n"
-            f"Abhi: {('`' + str(LOG['chat']) + '` ✅') if LOG['chat'] else 'set nahi ❌ (important alerts aapko DM aayenge)'}\n\n"
-            "Bot ko us channel/group me admin banao (post karne ki permission), phir Set dabao.")
-    kb = InlineKeyboardMarkup([
-        [B("✏️ Set Log Chat", callback_data="lgs"), B("🧪 Test", callback_data="lgt")],
-        [B("🗑 Remove", callback_data="lgx"), B("🔙 Back", callback_data="main")]])
-    return text, kb
-
 USERS_PER_PAGE = 10
 
-async def users_panel(page: int = 0):
+async def users_panel(uid: int, page: int = 0):
+    lang = await lang_of(uid)
     total = await db.users.count_documents({})
     pages = max(1, -(-total // USERS_PER_PAGE))
     page = max(0, min(page, pages - 1))
@@ -1010,69 +895,199 @@ async def users_panel(page: int = 0):
             n_chats += 1
             appr += c.get("approved", 0)
         full = " ".join(x for x in (u.get("first_name"), u.get("last_name")) if x) or "NoName"
-        uname = f"@{u['username']}" if u.get("username") else "no username"
-        badge = ("👑 " if u["_id"] in OWNERS else "") + ("🚫 " if u.get("banned") else "")
-        left = u.get("premium_until", 0) - now
-        plan = f"💎 Premium ({math.ceil(left / 86400)}d)" if left > 0 else "Free"
-        lines.append(f"**{i}.** {badge}{mention(full, u['_id'])}\n"
-                     f"   {uname} | ID: `{u['_id']}`\n"
-                     f"   Start: {fmt_ts(u.get('started'))}\n"
-                     f"   Last: {fmt_ts(u.get('last_seen'))}\n"
-                     f"   Plan: {plan} | Chats: {n_chats} | Approved: {appr}")
-    head = (f"**👥 Users**\nTotal: {total} | Naye (24h): {new24} | Active (24h): {act24}\n"
-            f"Page {page + 1}/{pages}\n\n")
-    text = (head + ("\n\n".join(lines) if lines else "Abhi koi user record nahi hai."))[:4000]
+        uname = f"@{u['username']}" if u.get("username") else tx(lang, "no_username")
+        lines.append(tx(lang, "u_entry", i=i, crown="👑 " if u["_id"] in OWNERS else "", who=mention(full, u["_id"]),
+                        uname=uname, uid=u["_id"], st=fmt_ts(u.get("started")), last=fmt_ts(u.get("last_seen")),
+                        nc=n_chats, ap=appr))
+    head = tx(lang, "u_head", total=total, new24=new24, act24=act24, p=page + 1, pages=pages)
+    text = (head + ("\n\n".join(lines) if lines else tx(lang, "u_none")))[:4000]
     nav = []
     if page > 0:
-        nav.append(B("⬅️ Back", callback_data=f"us:{page - 1}"))
+        nav.append(B(tx(lang, "nav_back"), callback_data=f"us:{page - 1}"))
     nav.append(B(f"{page + 1}/{pages}", callback_data="noop"))
     if page < pages - 1:
-        nav.append(B("Next ➡️", callback_data=f"us:{page + 1}"))
-    return text, InlineKeyboardMarkup([
-        nav,
-        [B("🚫 Ban/Unban ID", callback_data="bn"), B("📋 Banned", callback_data="bl")],
-        [B("💎 Premium Do/Hatao", callback_data="pa"), B("📋 Premiums", callback_data="pl")],
-        [B("🔙 Menu", callback_data="main")]])
+        nav.append(B(tx(lang, "nav_next"), callback_data=f"us:{page + 1}"))
+    return text, InlineKeyboardMarkup([nav, [B(tx(lang, "b_menu"), callback_data="main")]])
 
-async def list_panel(kind: str):
-    now = time.time()
-    if kind == "ban":
-        docs = [u async for u in db.users.find({"banned": True}).limit(40)]
-        title = "🚫 Banned users"
+async def delay_panel(uid: int):
+    lang = await lang_of(uid)
+    g = await gcfg()
+    kb = InlineKeyboardMarkup([
+        [B("🚀 1-5s", callback_data="dp:1:5"), B("🙂 2-15s", callback_data="dp:2:15")],
+        [B("🐢 10-40s", callback_data="dp:10:40"), B(tx(lang, "b_custom"), callback_data="dc")],
+        [B(tx(lang, "back"), callback_data="main")]])
+    return tx(lang, "dl_title", lo=g["min"], hi=g["max"]), kb
+
+async def session_panel(uid: int):
+    lang = await lang_of(uid)
+    note = tx(lang, "ses_clone_note") if IS_CLONE else ""
+    if user:
+        text = tx(lang, "ses_in", who=mention(helper["name"], helper["id"]), hid=helper["id"]) + note
+        rows = [[B(tx(lang, "b_logout"), callback_data="lo")], [B(tx(lang, "back"), callback_data="main")]]
     else:
-        docs = [u async for u in db.users.find({"premium_until": {"$gt": now}}).limit(40)]
-        title = "💎 Premium users"
-    lines = []
-    for u in docs:
-        full = " ".join(x for x in (u.get("first_name"), u.get("last_name")) if x) or "NoName"
-        extra = ""
-        if kind != "ban":
-            extra = f" — {math.ceil((u['premium_until'] - now) / 86400)} din baaki"
-        lines.append(f"• {mention(full, u['_id'])} `{u['_id']}`{extra}")
-    text = f"**{title} ({len(docs)})**\n\n" + ("\n".join(lines) or "Koi nahi.")
-    return text[:4000], InlineKeyboardMarkup([[B("🔙 Users", callback_data="us:0")]])
+        text = tx(lang, "ses_out") + note
+        rows = [[B(tx(lang, "b_login"), callback_data="lg")],
+                [B(tx(lang, "b_paste"), callback_data="ls")],
+                [B(tx(lang, "back"), callback_data="main")]]
+    return text, InlineKeyboardMarkup(rows)
+
+async def helper_panel(uid: int):
+    lang = await lang_of(uid)
+    return (helper_note(lang) + tx(lang, "helper_tail"),
+            InlineKeyboardMarkup([[B(tx(lang, "back"), callback_data="main")]]))
+
+
+# ======================= clone bots (main bot me) =======================
+async def clone_panel(uid: int):
+    lang = await lang_of(uid)
+    g = await gcfg()
+    d = await CLONES.find_one({"owner_id": uid})
+    if not d:
+        text = tx(lang, "k_rules") + ("" if g.get("clone_on", True) else "\n\n⚠️ " + tx(lang, "k_off"))
+        rows = [[B(tx(lang, "k_new"), callback_data="kn")], [B(tx(lang, "back"), callback_data="main")]]
+    else:
+        run = d["_id"] in RUNNING
+        text = tx(lang, "k_have", u=d.get("username") or d["_id"],
+                  st=tx(lang, "k_st_run" if run else "k_st_stop"), when=fmt_ts(d.get("created")))
+        rows = []
+        if d.get("username"):
+            rows.append([B(tx(lang, "k_open", u=d["username"]), url=f"https://t.me/{d['username']}")])
+        rows.append([B(tx(lang, "k_restart"), callback_data="kr"), B(tx(lang, "k_del"), callback_data="kd")])
+        rows.append([B(tx(lang, "back"), callback_data="main")])
+    return text, InlineKeyboardMarkup(rows)
+
+async def clones_admin_panel(uid: int, page: int = 0):
+    lang = await lang_of(uid)
+    g = await gcfg()
+    docs = [d async for d in CLONES.find({}).sort("created", 1)]
+    chunk = docs[page * PAGE:(page + 1) * PAGE]
+    items = "\n".join(tx(lang, "ka_item", u=d.get("username") or d["_id"], o=d["owner_id"],
+                         st="✅" if d["_id"] in RUNNING else "⏸") for d in chunk) or tx(lang, "ka_none")
+    on = g.get("clone_on", True)
+    rows = [[B(tx(lang, "ka_toggle", s=tick(on)), callback_data="kon")]]
+    rows += [[B(f"@{d.get('username') or d['_id']}"[:40], callback_data=f"kv:{d['_id']}")] for d in chunk]
+    nav = []
+    if page > 0:
+        nav.append(B("⬅️", callback_data=f"ka:{page - 1}"))
+    if (page + 1) * PAGE < len(docs):
+        nav.append(B("➡️", callback_data=f"ka:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([B(tx(lang, "back"), callback_data="main")])
+    return tx(lang, "ka_head", n=len(docs), max=MAX_CLONES, on=tick(on), items=items), InlineKeyboardMarkup(rows)
+
+async def clone_detail_panel(uid: int, bid: int):
+    lang = await lang_of(uid)
+    d = await CLONES.find_one({"_id": bid})
+    if not d:
+        raise UserError(tx(lang, "ka_none"))
+    st = Store(f"c{bid}_")
+    run = bid in RUNNING
+    text = tx(lang, "kv_text", u=d.get("username") or bid, bid=bid, owner=mention(d["owner_id"], d["owner_id"]),
+              st=tx(lang, "k_st_run" if run else "k_st_stop"), when=fmt_ts(d.get("created")),
+              nc=await st.chats.count_documents({}), nu=await st.users.count_documents({}))
+    rows = [[B(tx(lang, "kv_stop" if run else "kv_start"), callback_data=f"kt:{bid}"),
+             B(tx(lang, "k_del"), callback_data=f"kz:{bid}")],
+            [B(tx(lang, "back"), callback_data="ka:0")]]
+    return text, InlineKeyboardMarkup(rows)
+
+async def boot_instance(inst, workers: int):
+    """Bot (main ya clone) ki settings + helper session load karke workers chalata hai."""
+    try:
+        STATE["public"] = bool((await gcfg()).get("public", False))
+    except Exception as e:
+        log.warning("settings load fail (%s): %s", inst.key, e)
+    try:
+        await load_user()
+    except Exception as e:
+        log.warning("session load fail (%s): %s", inst.key, e)
+    for _ in range(workers):
+        inst.workers.append(asyncio.create_task(worker()))
+
+async def start_clone(doc: dict):
+    bid = int(doc["_id"])
+    if bid in RUNNING:
+        return RUNNING[bid]
+    token = dec(doc.get("token"))
+    if not token:
+        raise RuntimeError("token decrypt nahi hua (SECRET_KEY badla?)")
+    key = f"clone{bid}"
+    client = Client(key, api_id=API_ID, api_hash=API_HASH, bot_token=token, in_memory=True)
+    inst = Inst(key, client, {int(doc["owner_id"])}, Store(f"c{bid}_"), clone_owner=int(doc["owner_id"]), bot_id=bid)
+    INSTANCES[key] = inst
+    attach(inst)
+    try:
+        await client.start()
+        me = await client.get_me()
+        inst.bot_id["id"], inst.username = me.id, me.username
+        await run_in(inst, boot_instance, inst, CLONE_WORKERS)
+    except Exception:
+        INSTANCES.pop(key, None)
+        try:
+            await client.stop()
+        except Exception:
+            pass
+        raise
+    RUNNING[bid] = inst
+    return inst
+
+async def stop_clone(bid: int):
+    inst = RUNNING.pop(bid, None)
+    if not inst:
+        return
+    for w in inst.workers:
+        w.cancel()
+    await run_in(inst, stop_user)
+    try:
+        await inst.client.stop()
+    except Exception:
+        pass
+    INSTANCES.pop(inst.key, None)
+
+async def delete_clone(bid: int):
+    await stop_clone(bid)
+    await Store(f"c{bid}_").drop()
+    await CLONES.delete_one({"_id": bid})
+
+async def create_clone(uid: int, token: str, lang: str):
+    g = await gcfg()
+    if not g.get("clone_on", True) and uid not in OWNERS:
+        raise UserError(tx(lang, "k_off"))
+    if not TOKEN_RE.fullmatch(token):
+        raise UserError(tx(lang, "k_badtoken"))
+    bid = int(token.split(":")[0])
+    if bid == BOT_ID["id"]:
+        raise UserError(tx(lang, "k_same"))
+    if await CLONES.find_one({"_id": bid}):
+        raise UserError(tx(lang, "k_dup"))
+    if await CLONES.find_one({"owner_id": uid}):
+        raise UserError(tx(lang, "k_one"))
+    if await CLONES.count_documents({}) >= MAX_CLONES:
+        raise UserError(tx(lang, "k_full"))
+    doc = {"_id": bid, "owner_id": uid, "token": enc(token), "created": time.time(), "active": True}
+    try:
+        inst = await start_clone(doc)
+    except Exception as e:
+        log.warning("clone start fail: %s", type(e).__name__)
+        raise UserError(tx(lang, "k_invalid"))
+    doc["username"] = inst.username
+    await CLONES.update_one({"_id": bid}, {"$set": doc}, upsert=True)
+    return inst
 
 
 # ======================= commands =======================
-@bot.on_message(filters.command(["start", "settings", "help"]) & filters.private)
+@on_message(filters.command(["start", "settings", "help"]) & filters.private)
 @safe
 async def start(_, m: Message):
     uid = m.from_user.id
     await touch_user(m.from_user)
     lang = await lang_of(uid)
-    if uid in BANNED:
-        return await m.reply(tx(lang, "banned"))
     if uid not in OWNERS and not STATE["public"]:
         return await m.reply(tx(lang, "private_bot", uid=uid))
     await cancel_login(uid)
     await show(m, *await main_panel(uid))
 
-@bot.on_message(filters.command("plan") & filters.private & is_user)
-@safe
-async def cmd_plan(_, m: Message):
-    await show(m, *await plan_panel(m.from_user.id))
-
-@bot.on_message(filters.command("id") & filters.private)
+@on_message(filters.command("id") & filters.private)
 async def my_id(_, m: Message):
     uid = m.from_user.id
     extra = f"\nOWNER_IDS: `{sorted(OWNERS)}`\nOwner match: {uid in OWNERS}" if uid in OWNERS or not OWNERS else ""
@@ -1080,108 +1095,58 @@ async def my_id(_, m: Message):
 
 async def mongo_status() -> str:
     try:
-        await asyncio.wait_for(db.command("ping"), 10)
+        await asyncio.wait_for(MDB.command("ping"), 10)
         return "✅ MongoDB OK"
     except Exception as e:
         return f"❌ MongoDB error: {type(e).__name__}: {str(e)[:500]}"
 
-@bot.on_message(filters.command("ping") & filters.private)
+@on_message(filters.command("ping") & filters.private)
 async def ping(_, m: Message):
     if m.from_user.id not in OWNERS:
         return await m.reply("🏓 pong")
-    await m.reply(f"🏓 pong\n{await mongo_status()}\nHelper session: {'✅' if user else '❌'}\n"
-                  f"Mode: {'🌐 Public' if STATE['public'] else '🔒 Private'}\nLog: {LOG['chat'] or '❌'}")
+    lang = await lang_of(m.from_user.id)
+    await m.reply(tx(lang, "ping_full", mongo=await mongo_status(), h="✅" if user else "❌",
+                     mode=tx(lang, "mode_pub" if STATE["public"] else "mode_priv"), nc=len(RUNNING)))
 
-@bot.on_message(filters.command(["public", "private"]) & filters.private & is_owner)
+@on_message(filters.command(["public", "private"]) & filters.private & is_owner)
 @safe
 async def cmd_mode(_, m: Message):
     pub = m.command[0] == "public"
     STATE["public"] = pub
     await gset(public=pub)
-    await m.reply("🌐 Bot ab **Public** hai: koi bhi apne chat add kar sakta hai." if pub
-                  else "🔒 Bot ab **Private** hai: sirf admin panel use kar sakta hai.\n"
-                       "(Pehle se add chats me approve chalta rahega.)")
+    await m.reply(tx(await lang_of(m.from_user.id), "mode_set_pub" if pub else "mode_set_priv"))
 
-@bot.on_message(filters.command("users") & filters.private & is_owner)
+@on_message(filters.command("users") & filters.private & is_owner)
 @safe
 async def cmd_users(_, m: Message):
-    await show(m, *await users_panel(0))
+    await show(m, *await users_panel(m.from_user.id, 0))
 
-async def do_premium(uid: int, days: int, by: int):
-    until = await set_premium(uid, days)
-    lang = await lang_of(uid)
-    if until:
-        d = max(1, math.ceil((until - time.time()) / 86400))
-        try:
-            await bot.send_message(uid, tx(lang, "prem_got", d=days))
-        except Exception:
-            pass
-        await notify_admin(f"💎 Premium diya: `{uid}` +{days} din (kul {d} din) — by `{by}`")
-        return f"✅ `{uid}` ko {days} din Premium diya (kul {d} din baaki)."
-    await notify_admin(f"💎 Premium hataya: `{uid}` — by `{by}`")
-    return f"✅ `{uid}` ka Premium hata diya (Free)."
-
-async def do_ban(uid: int, flag: bool, by: int):
-    if uid in OWNERS:
-        raise UserError("Admin ko ban nahi kar sakte.")
-    await set_ban(uid, flag)
-    await notify_admin(f"{'🚫 Ban' if flag else '✅ Unban'}: `{uid}` — by `{by}`")
-    return f"{'🚫 Ban' if flag else '✅ Unban'} ho gaya: `{uid}`"
-
-@bot.on_message(filters.command("premium") & filters.private & is_owner)
-@safe
-async def cmd_premium(_, m: Message):
-    if len(m.command) < 3:
-        raise UserError("Usage: /premium <user_id> <days>")
-    await m.reply(await do_premium(int(m.command[1]), int(m.command[2]), m.from_user.id))
-
-@bot.on_message(filters.command("free") & filters.private & is_owner)
-@safe
-async def cmd_free(_, m: Message):
-    await m.reply(await do_premium(int(m.command[1]), 0, m.from_user.id))
-
-@bot.on_message(filters.command("ban") & filters.private & is_owner)
-@safe
-async def cmd_ban(_, m: Message):
-    await m.reply(await do_ban(int(m.command[1]), True, m.from_user.id))
-
-@bot.on_message(filters.command("unban") & filters.private & is_owner)
-@safe
-async def cmd_unban(_, m: Message):
-    await m.reply(await do_ban(int(m.command[1]), False, m.from_user.id))
-
-@bot.on_message(filters.command("banned") & filters.private & is_owner)
-@safe
-async def cmd_banned(_, m: Message):
-    await show(m, *await list_panel("ban"))
-
-@bot.on_message(filters.command("premiums") & filters.private & is_owner)
-@safe
-async def cmd_premiums(_, m: Message):
-    await show(m, *await list_panel("prem"))
-
-@bot.on_message(filters.command("approveold") & filters.private & is_owner)
+@on_message(filters.command("approveold") & filters.private & is_owner)
 @safe
 async def cmd_old(_, m: Message):
+    lang = await lang_of(m.from_user.id)
     cid = int(m.command[1])
-    err = await old_precheck(cid, await lang_of(m.from_user.id))
+    err = await old_precheck(cid, lang)
     if err:
         return await m.reply(err)
     old_tasks[cid] = asyncio.create_task(approve_old(cid, m.chat.id))
-    await m.reply("▶️ Started")
+    await m.reply(tx(lang, "old_started"))
 
-@bot.on_message(filters.command("stopold") & filters.private & is_owner)
+@on_message(filters.command("stopold") & filters.private & is_owner)
 @safe
 async def cmd_stop(_, m: Message):
+    lang = await lang_of(m.from_user.id)
     t = old_tasks.get(int(m.command[1]))
     if t:
         t.cancel()
-    await m.reply("🛑 Stopping..." if t else "Koi task nahi.")
+    await m.reply(tx(lang, "old_stopping") if t else tx(lang, "old_nothing"))
 
 
 # ======================= chat add / membership =======================
-async def check_admin(uid: int, chat, lang: str, need_invite: bool):
+async def verify_add(uid: int, chat, lang: str):
     if uid not in OWNERS:
+        if await db.chats.count_documents({"owner_id": uid, "_id": {"$ne": chat.id}}) >= MAX_CHATS:
+            raise UserError(tx(lang, "max_chats", lim=MAX_CHATS))
         try:
             mem = await bot.get_chat_member(chat.id, uid)
         except Exception:
@@ -1194,66 +1159,42 @@ async def check_admin(uid: int, chat, lang: str, need_invite: bool):
         raise UserError(tx(lang, "e_bot_not_in"))
     if me.status != ChatMemberStatus.ADMINISTRATOR:
         raise UserError(tx(lang, "e_bot_not_admin"))
-    if need_invite and not (me.privileges and me.privileges.can_invite_users):
+    if not (me.privileges and me.privileges.can_invite_users):
         raise UserError(tx(lang, "e_bot_noinvite"))
 
-async def verify_add(uid: int, chat, lang: str):
-    if uid not in OWNERS:
-        lim = await max_chats(uid)
-        if await db.chats.count_documents({"owner_id": uid, "_id": {"$ne": chat.id}}) >= lim:
-            raise UserError(tx(lang, "max_chats", lim=lim))
-    await check_admin(uid, chat, lang, need_invite=True)
-
-@bot.on_chat_member_updated()
+@on_member_update()
 async def on_member(_, u):
-    """Bot ko admin banate hi chat user ke naam register ho jata hai; hataye jaane par alert."""
+    """Bot ko admin banate hi chat user ke naam register ho jata hai."""
     try:
-        new, old = u.new_chat_member, u.old_chat_member
-        if not new or not new.user or new.user.id != BOT_ID["id"]:
+        new = u.new_chat_member
+        if not new or not new.user or new.user.id != BOT_ID["id"] or new.status != ChatMemberStatus.ADMINISTRATOR:
             return
-        c = await ccfg(u.chat.id) or {}
-        oid = c.get("owner_id")
-        lost = new.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
-        demoted = (old is not None and old.status == ChatMemberStatus.ADMINISTRATOR
-                   and new.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED))
-        if lost or demoted:
-            key = "bot_removed" if lost else "bot_demoted"
-            if oid:
-                try:
-                    await bot.send_message(oid, tx(await lang_of(oid), key, title=clean(u.chat.title)))
-                except Exception:
-                    pass
-            await notify_admin(f"⚠️ Bot {'hataya gaya' if lost else 'demote hua'}: {clean(u.chat.title)} `{u.chat.id}`"
-                               f" (owner `{oid}`)", important=bool(oid is None))
-            return
-        if new.status != ChatMemberStatus.ADMINISTRATOR or not u.from_user:
+        if not u.from_user:
             return
         uid = u.from_user.id
         lang = await lang_of(uid)
         if uid not in OWNERS:
-            if not STATE["public"] or uid in BANNED:
+            if not STATE["public"]:
                 return
-            lim = await max_chats(uid)
-            if await db.chats.count_documents({"owner_id": uid, "_id": {"$ne": u.chat.id}}) >= lim:
-                await bot.send_message(uid, tx(lang, "max_chats", lim=lim))
+            if await db.chats.count_documents({"owner_id": uid, "_id": {"$ne": u.chat.id}}) >= MAX_CHATS:
+                await bot.send_message(uid, tx(lang, "max_chats", lim=MAX_CHATS))
                 return
         await register_chat(u.chat, uid)
         c = await ccfg(u.chat.id) or {}
         if uid not in OWNERS and c.get("owner_id") != uid:
             return
         warn = "" if (new.privileges and new.privileges.can_invite_users) else tx(lang, "warn_noinvite")
-        await notify_admin(f"📺 Naya chat: {clean(u.chat.title)} `{u.chat.id}` — user `{uid}`")
         await bot.send_message(uid, tx(lang, "member_added", title=clean(u.chat.title), warn=warn, note=helper_note(lang)))
     except Exception as e:
         log.warning("on_member: %s", e)
 
 
 # ======================= callbacks =======================
-OWNER_ACTS = {"us", "g", "ses", "lg", "ls", "lo", "delay", "dp", "dc", "wt", "pub",
-              "lgp", "lgs", "lgt", "lgx", "bn", "bl", "pa", "pl"}
-CHAT_ACTS = {"c", "ct", "cr", "cd", "co", "cs", "cx", "cw", "ce", "fr", "fc", "fq", "cc", "cl", "fs", "fa", "fd"}
+OWNER_ACTS = {"us", "g", "ses", "lg", "ls", "lo", "delay", "dp", "dc", "wt", "pub", "ka", "kv", "kt", "kz", "kzy", "kon"}
+MAIN_ONLY = {"k", "kn", "kr", "kd", "kdy", "ka", "kv", "kt", "kz", "kzy", "kon"}
+CHAT_ACTS = {"c", "ct", "cr", "cd", "co", "cs", "cx", "cw", "ce", "fr", "fc", "fq"}
 
-@bot.on_callback_query(is_user)
+@on_callback(is_user)
 @safe
 async def cb(_, q: CallbackQuery):
     act, _, arg = q.data.partition(":")
@@ -1263,111 +1204,21 @@ async def cb(_, q: CallbackQuery):
     try:
         if act in OWNER_ACTS and uid not in OWNERS:
             return await q.answer(tx(lang, "q_owner_only"), show_alert=True)
-        if act in CHAT_ACTS and not await can_manage(uid, int(arg.split(":")[0])):
+        if act in MAIN_ONLY and IS_CLONE:
+            return await q.answer(tx(lang, "q_main_only"), show_alert=True)
+        if act in CHAT_ACTS and not await can_manage(uid, int(arg)):
             return await q.answer(tx(lang, "q_no_access"), show_alert=True)
 
         if act == "noop":
             return
+        if act == "us":
+            return await show(q, *await users_panel(uid, int(arg)))
         if act == "main":
             await cancel_login(uid)
             return await show(q, *await main_panel(uid))
         if act == "lang":
             await set_lang(uid, "en" if lang == "hi" else "hi")
             return await show(q, *await main_panel(uid))
-        if act == "plan":
-            return await show(q, *await plan_panel(uid))
-        if act == "oh":
-            return await show(q, *await helper_panel(uid))
-        if act == "chats":
-            await cancel_login(uid)
-            return await show(q, *await chats_panel(uid))
-        if act == "p":
-            return await show(q, *await chats_panel(uid, int(arg)))
-        if act == "add":
-            pending[uid] = ("add",)
-            return await q.message.reply(tx(lang, "add_prompt"))
-        # ---------- chat actions
-        if act == "c":
-            return await show(q, *await chat_panel(int(arg), uid))
-        cid = int(arg.split(":")[0]) if act in CHAT_ACTS else 0
-        if act == "ct":
-            c = await ccfg(cid) or {}
-            await db.chats.update_one({"_id": cid}, {"$set": {"enabled": not c.get("enabled", True)}}, upsert=True)
-            return await show(q, *await chat_panel(cid, uid))
-        if act == "cr":
-            await db.chats.update_one({"_id": cid}, {"$unset": {"min": "", "max": ""}})
-            return await show(q, *await chat_panel(cid, uid))
-        if act == "cd":
-            pending[uid] = ("cdelay", cid)
-            return await q.message.reply(tx(lang, "cd_prompt"))
-        if act == "cw":
-            c, g = await ccfg(cid) or {}, await gcfg()
-            on, _w = welcome_of(c, g)
-            await db.chats.update_one({"_id": cid}, {"$set": {"welcome_on": not on}}, upsert=True)
-            return await show(q, *await chat_panel(cid, uid))
-        if act == "ce":
-            pending[uid] = ("cwelcome", cid)
-            return await q.message.reply(tx(lang, "ce_prompt"))
-        if act == "cl":
-            c = await ccfg(cid) or {}
-            await db.chats.update_one({"_id": cid}, {"$set": {"lang": "en" if c.get("lang", "hi") == "hi" else "hi"}}, upsert=True)
-            return await show(q, *await chat_panel(cid, uid))
-        if act == "cc":
-            c = await ccfg(cid) or {}
-            if not await chat_is_premium(c):
-                return await q.answer(tx(lang, "locked"), show_alert=True)
-            modes = ["off", "human", "math"]
-            nxt = modes[(modes.index(c.get("captcha", "off")) + 1) % 3]
-            await db.chats.update_one({"_id": cid}, {"$set": {"captcha": nxt}}, upsert=True)
-            return await show(q, *await chat_panel(cid, uid))
-        if act == "fs":
-            if not await chat_is_premium(await ccfg(cid) or {}):
-                return await q.answer(tx(lang, "locked"), show_alert=True)
-            return await show(q, *await fsub_panel(cid, uid))
-        if act == "fa":
-            if len((await ccfg(cid) or {}).get("fsub", [])) >= 3:
-                return await q.answer(tx(lang, "fs_max"), show_alert=True)
-            pending[uid] = ("fsadd", cid)
-            return await q.message.reply(tx(lang, "fs_ask"))
-        if act == "fd":
-            c = await ccfg(cid) or {}
-            lst = c.get("fsub", [])
-            idx = int(arg.split(":")[1])
-            if 0 <= idx < len(lst):
-                lst.pop(idx)
-                await db.chats.update_one({"_id": cid}, {"$set": {"fsub": lst}})
-            return await show(q, *await fsub_panel(cid, uid))
-        if act == "co":
-            if not await chat_is_premium(await ccfg(cid) or {}):
-                return await q.answer(tx(lang, "locked"), show_alert=True)
-            err = await old_precheck(cid, lang)
-            if err:
-                return await q.message.reply(err)
-            old_tasks[cid] = asyncio.create_task(approve_old(cid, uid))
-            await q.answer(tx(lang, "q_started"))
-            return await show(q, *await chat_panel(cid, uid))
-        if act == "cs":
-            t = old_tasks.get(cid)
-            if t:
-                t.cancel()
-            await q.answer(tx(lang, "q_stopping"))
-            await asyncio.sleep(1)
-            return await show(q, *await chat_panel(cid, uid))
-        if act == "cx":
-            await db.chats.delete_one({"_id": cid})
-            await db.fails.delete_many({"chat_id": cid})
-            await q.answer(tx(lang, "q_removed"))
-            return await show(q, *await chats_panel(uid))
-        if act == "fr":
-            return await show(q, *await fails_panel(cid, uid))
-        if act == "fc":
-            await db.fails.delete_many({"chat_id": cid})
-            await q.answer(tx(lang, "q_clear"))
-            return await show(q, *await fails_panel(cid, uid))
-        if act == "fq":
-            pending[uid] = ("whyid", cid)
-            return await q.message.reply(tx(lang, "f_ask"))
-        # ---------- owner only
         if act == "g":
             g = await gcfg()
             await gset(**{arg: not g[arg]})
@@ -1376,61 +1227,164 @@ async def cb(_, q: CallbackQuery):
             STATE["public"] = not STATE["public"]
             await gset(public=STATE["public"])
             return await show(q, *await main_panel(uid))
-        if act == "us":
-            return await show(q, *await users_panel(int(arg)))
-        if act == "bn":
-            pending[uid] = ("ban",)
-            return await q.message.reply("Ban/Unban karne wale user ki **ID** bhejo (banned ho to unban ho jayega).")
-        if act == "pa":
-            pending[uid] = ("prem",)
-            return await q.message.reply("Format: `user_id din`  (jaise `123456789 30`)\n`din = 0` likhoge to Premium hat jayega.")
-        if act == "bl":
-            return await show(q, *await list_panel("ban"))
-        if act == "pl":
-            return await show(q, *await list_panel("prem"))
-        if act == "lgp":
-            return await show(q, *log_panel())
-        if act == "lgs":
-            pending[uid] = ("logchat",)
-            return await q.message.reply("Log channel/group ki ID (`-100...`), @username bhejo ya uska koi message forward karo.")
-        if act == "lgt":
-            if not LOG["chat"]:
-                return await q.answer("Log chat set nahi hai", show_alert=True)
-            await bot.send_message(LOG["chat"], "🧪 Test log message ✅")
-            return await q.answer("Test bhej diya")
-        if act == "lgx":
-            LOG["chat"] = None
-            await gset(log_chat=None)
-            await q.answer("Log chat hata diya")
-            return await show(q, *log_panel())
+        if act == "chats":
+            await cancel_login(uid)
+            return await show(q, *await chats_panel(uid))
+        if act == "p":
+            return await show(q, *await chats_panel(uid, int(arg)))
+        if act == "oh":
+            return await show(q, *await helper_panel(uid))
+        if act == "add":
+            pending[uid] = ("add",)
+            return await q.message.reply(tx(lang, "add_prompt"))
+        # ---- clone bots (main bot only)
+        if act == "k":
+            return await show(q, *await clone_panel(uid))
+        if act == "kn":
+            if await CLONES.find_one({"owner_id": uid}):
+                return await q.answer(tx(lang, "k_one"), show_alert=True)
+            pending[uid] = ("ctoken",)
+            return await q.message.reply(tx(lang, "k_ask_token"))
+        if act == "kr":
+            d = await CLONES.find_one({"owner_id": uid})
+            if d:
+                await stop_clone(d["_id"])
+                try:
+                    await start_clone(d)
+                except Exception:
+                    raise UserError(tx(lang, "k_invalid"))
+                await q.message.reply(tx(lang, "k_restarted"))
+            return await show(q, *await clone_panel(uid))
+        if act == "kd":
+            d = await CLONES.find_one({"owner_id": uid})
+            if not d:
+                return await show(q, *await clone_panel(uid))
+            return await show(q, tx(lang, "k_del_ask", u=d.get("username") or d["_id"]),
+                              InlineKeyboardMarkup([[B(tx(lang, "k_yes"), callback_data="kdy"), B(tx(lang, "k_no"), callback_data="k")]]))
+        if act == "kdy":
+            d = await CLONES.find_one({"owner_id": uid})
+            if d:
+                await delete_clone(d["_id"])
+                await q.message.reply(tx(lang, "k_deleted"))
+            return await show(q, *await clone_panel(uid))
+        if act == "ka":
+            return await show(q, *await clones_admin_panel(uid, int(arg)))
+        if act == "kon":
+            g = await gcfg()
+            await gset(clone_on=not g.get("clone_on", True))
+            return await show(q, *await clones_admin_panel(uid))
+        if act == "kv":
+            return await show(q, *await clone_detail_panel(uid, int(arg)))
+        if act == "kt":
+            bid = int(arg)
+            d = await CLONES.find_one({"_id": bid})
+            if d:
+                if bid in RUNNING:
+                    await stop_clone(bid)
+                    await CLONES.update_one({"_id": bid}, {"$set": {"active": False}})
+                else:
+                    try:
+                        await start_clone(d)
+                        await CLONES.update_one({"_id": bid}, {"$set": {"active": True}})
+                    except Exception:
+                        raise UserError(tx(lang, "k_invalid"))
+            return await show(q, *await clone_detail_panel(uid, bid))
+        if act == "kz":
+            d = await CLONES.find_one({"_id": int(arg)})
+            if not d:
+                return await show(q, *await clones_admin_panel(uid))
+            return await show(q, tx(lang, "kz_ask", u=d.get("username") or d["_id"]),
+                              InlineKeyboardMarkup([[B(tx(lang, "k_yes"), callback_data=f"kzy:{arg}"), B(tx(lang, "k_no"), callback_data=f"kv:{arg}")]]))
+        if act == "kzy":
+            bid = int(arg)
+            d = await CLONES.find_one({"_id": bid})
+            if d:
+                await delete_clone(bid)
+                try:
+                    await bot.send_message(d["owner_id"], tx(await lang_of(d["owner_id"]), "k_admin_removed"))
+                except Exception:
+                    pass
+            return await show(q, *await clones_admin_panel(uid))
+        # ---- chat actions
+        if act == "c":
+            return await show(q, *await chat_panel(int(arg), uid))
+        if act == "ct":
+            cid = int(arg)
+            c = await ccfg(cid) or {}
+            await db.chats.update_one({"_id": cid}, {"$set": {"enabled": not c.get("enabled", True)}}, upsert=True)
+            return await show(q, *await chat_panel(cid, uid))
+        if act == "cr":
+            await db.chats.update_one({"_id": int(arg)}, {"$unset": {"min": "", "max": ""}})
+            return await show(q, *await chat_panel(int(arg), uid))
+        if act == "cd":
+            pending[uid] = ("cdelay", int(arg))
+            return await q.message.reply(tx(lang, "cd_prompt"))
+        if act == "cw":
+            cid = int(arg)
+            c, g = await ccfg(cid) or {}, await gcfg()
+            on, _w = welcome_of(c, g)
+            await db.chats.update_one({"_id": cid}, {"$set": {"welcome_on": not on}}, upsert=True)
+            return await show(q, *await chat_panel(cid, uid))
+        if act == "ce":
+            pending[uid] = ("cwelcome", int(arg))
+            return await q.message.reply(tx(lang, "ce_prompt"))
+        if act == "co":
+            cid = int(arg)
+            err = await old_precheck(cid, lang)
+            if err:
+                return await q.message.reply(err)
+            old_tasks[cid] = asyncio.create_task(approve_old(cid, uid))
+            await q.answer(tx(lang, "q_started"))
+            return await show(q, *await chat_panel(cid, uid))
+        if act == "cs":
+            t = old_tasks.get(int(arg))
+            if t:
+                t.cancel()
+            await q.answer(tx(lang, "q_stopping"))
+            await asyncio.sleep(1)
+            return await show(q, *await chat_panel(int(arg), uid))
+        if act == "cx":
+            await db.chats.delete_one({"_id": int(arg)})
+            await db.fails.delete_many({"chat_id": int(arg)})
+            await q.answer(tx(lang, "q_removed"))
+            return await show(q, *await chats_panel(uid))
+        if act == "fr":
+            return await show(q, *await fails_panel(int(arg), uid))
+        if act == "fc":
+            await db.fails.delete_many({"chat_id": int(arg)})
+            await q.answer(tx(lang, "q_clear"))
+            return await show(q, *await fails_panel(int(arg), uid))
+        if act == "fq":
+            pending[uid] = ("whyid", int(arg))
+            return await q.message.reply(tx(lang, "f_ask"))
+        # ---- owner only
         if act == "ses":
-            return await show(q, *await session_panel())
+            return await show(q, *await session_panel(uid))
         if act == "lg":
             await cancel_login(uid)
             pending[uid] = ("lphone",)
-            return await q.message.reply("📲 Helper account ka phone number bhejo country code ke saath, jaise `+919876543210`")
+            return await q.message.reply(tx(lang, "ses_phone"))
         if act == "ls":
             pending[uid] = ("lstr",)
-            return await q.message.reply("📋 Pyrogram SESSION_STRING paste karo (message turant delete kar diya jayega).")
+            return await q.message.reply(tx(lang, "ses_str"))
         if act == "lo":
             await stop_user()
             await db.settings.delete_one({"_id": "session"})
-            await q.answer("Logout ho gaya")
-            return await show(q, *await session_panel())
+            await q.answer(tx(lang, "ses_bye"))
+            return await show(q, *await session_panel(uid))
         if act == "delay":
-            return await show(q, *await delay_panel())
+            return await show(q, *await delay_panel(uid))
         if act == "dp":
             lo, hi = arg.split(":")
             await gset(min=float(lo), max=float(hi))
-            return await show(q, *await delay_panel())
+            return await show(q, *await delay_panel(uid))
         if act == "dc":
             pending[uid] = ("delay",)
-            return await q.message.reply("Global delay bhejo: `min max`  (jaise `2 15`)")
+            return await q.message.reply(tx(lang, "gd_prompt"))
         if act == "wt":
             pending[uid] = ("welcome",)
             g = await gcfg()
-            return await q.message.reply(f"Abhi: `{g['welcome']}`\n\nNaya global welcome text bhejo. "
-                                         "`{name}` aur `{chat}` use kar sakte ho.")
+            return await q.message.reply(tx(lang, "wt_prompt", cur=g["welcome"]))
     finally:
         try:
             await q.answer()
@@ -1439,7 +1393,7 @@ async def cb(_, q: CallbackQuery):
 
 
 # ======================= text input (button ke baad) =======================
-OWNER_KINDS = {"lphone", "lcode", "lpass", "lstr", "delay", "welcome", "logchat", "ban", "prem"}
+OWNER_KINDS = {"lphone", "lcode", "lpass", "lstr", "delay", "welcome"}
 
 def check_template(text: str, lang: str = "hi"):
     try:
@@ -1447,12 +1401,7 @@ def check_template(text: str, lang: str = "hi"):
     except Exception:
         raise UserError(tx(lang, "e_tpl"))
 
-def chat_ref(m: Message):
-    fo = getattr(m, "forward_from_chat", None) or getattr(getattr(m, "forward_origin", None), "chat", None)
-    ref = fo.id if fo else (m.text or "").strip()
-    return int(ref) if str(ref).lstrip("-").isdigit() else ref
-
-@bot.on_message(filters.private & is_user & ~filters.regex(r"^/"), group=1)
+@on_message(filters.private & is_user & ~filters.regex(r"^/"), group=1)
 @safe
 async def on_input(_, m: Message):
     uid = m.from_user.id
@@ -1462,10 +1411,22 @@ async def on_input(_, m: Message):
     await touch_user(m.from_user)
     kind = st[0]
     lang = await lang_of(uid)
-    if kind in OWNER_KINDS and uid not in OWNERS:
+    if (kind in OWNER_KINDS and uid not in OWNERS) or (kind == "ctoken" and IS_CLONE):
         pending.pop(uid, None)
         return
     try:
+        if kind == "ctoken":
+            token = (m.text or "").strip()
+            await try_delete(m)              # token chat me na rahe
+            pending.pop(uid, None)
+            wait = await m.reply(tx(lang, "k_wait"))
+            try:
+                inst = await create_clone(uid, token, lang)
+            finally:
+                await try_delete(wait)
+            return await m.reply(tx(lang, "k_done", u=inst.username),
+                                 reply_markup=InlineKeyboardMarkup(
+                                     [[B(tx(lang, "k_open", u=inst.username), url=f"https://t.me/{inst.username}")]]))
         if kind == "lphone":
             phone = m.text.strip().replace(" ", "")
             tmp = Client(f"login{uid}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
@@ -1477,86 +1438,43 @@ async def on_input(_, m: Message):
                 raise
             logins[uid] = {"c": tmp, "phone": phone, "hash": sent.phone_code_hash}
             pending[uid] = ("lcode",)
-            return await m.reply("📨 Telegram ne us account me OTP bheja hai.\n\n"
-                                 "Code **spaces ke saath** bhejo, jaise `1 2 3 4 5` "
-                                 "(seedha bhejoge to Telegram code block kar deta hai).")
+            return await m.reply(tx(lang, "ses_otp"))
         if kind == "lcode":
-            lgn = logins[uid]
+            lg = logins[uid]
             code = "".join(ch for ch in m.text if ch.isdigit())
             await try_delete(m)
             try:
-                await lgn["c"].sign_in(lgn["phone"], lgn["hash"], code)
+                await lg["c"].sign_in(lg["phone"], lg["hash"], code)
             except SessionPasswordNeeded:
                 pending[uid] = ("lpass",)
-                return await m.reply("🔐 2-step verification password bhejo (message delete ho jayega).")
-            return await finish_login(m, uid)
+                return await m.reply(tx(lang, "ses_2fa"))
+            return await finish_login(m, uid, lang)
         if kind == "lpass":
-            lgn = logins[uid]
+            lg = logins[uid]
             await try_delete(m)
-            await lgn["c"].check_password(m.text)
-            return await finish_login(m, uid)
+            await lg["c"].check_password(m.text)
+            return await finish_login(m, uid, lang)
         if kind == "lstr":
             await try_delete(m)
-            await start_user(m.text.strip())
-            await db.settings.update_one({"_id": "session"}, {"$set": {"string": m.text.strip()}}, upsert=True)
+            sess = m.text.strip()
+            await start_user(sess)
+            await save_session(sess)
             pending.pop(uid, None)
-            await m.reply("✅ Session set ho gaya.")
-            return await show(m, *await session_panel())
-        if kind == "logchat":
-            try:
-                ch = await bot.get_chat(chat_ref(m))
-                await bot.send_message(ch.id, "✅ Log channel set ho gaya.")
-            except Exception as e:
-                raise UserError(f"Is chat me message nahi bhej paaya ({type(e).__name__}). Bot ko wahan admin banao.")
-            LOG["chat"] = ch.id
-            await gset(log_chat=ch.id)
-            pending.pop(uid, None)
-            return await show(m, *log_panel())
-        if kind == "ban":
-            target = int(m.text.strip())
-            res = await do_ban(target, target not in BANNED, uid)
-            pending.pop(uid, None)
-            await m.reply(res)
-            return await show(m, *await users_panel(0))
-        if kind == "prem":
-            a = m.text.split()
-            res = await do_premium(int(a[0]), int(a[1]), uid)
-            pending.pop(uid, None)
-            await m.reply(res)
-            return await show(m, *await users_panel(0))
+            await m.reply(tx(lang, "ses_set"))
+            return await show(m, *await session_panel(uid))
         if kind == "add":
+            fo = getattr(m, "forward_from_chat", None) or getattr(getattr(m, "forward_origin", None), "chat", None)
+            ref = fo.id if fo else (m.text or "").strip()
+            ref = int(ref) if str(ref).lstrip("-").isdigit() else ref
             try:
-                chat = await bot.get_chat(chat_ref(m))
+                chat = await bot.get_chat(ref)
             except Exception:
                 raise UserError(tx(lang, "e_notfound"))
             await verify_add(uid, chat, lang)
             pending.pop(uid, None)
             await register_chat(chat, uid, force=(uid not in OWNERS))
-            await notify_admin(f"📺 Naya chat (manual): {clean(chat.title)} `{chat.id}` — user `{uid}`")
             await m.reply(f"{tx(lang, 'added', title=clean(chat.title))}\n\n{helper_note(lang)}")
             return await show(m, *await chat_panel(chat.id, uid))
-        if kind == "fsadd":
-            cid = st[1]
-            try:
-                ch = await bot.get_chat(chat_ref(m))
-            except Exception:
-                raise UserError(tx(lang, "e_notfound"))
-            await check_admin(uid, ch, lang, need_invite=False)
-            link = f"https://t.me/{ch.username}" if getattr(ch, "username", None) else None
-            if not link:
-                try:
-                    link = await bot.export_chat_invite_link(ch.id)
-                except Exception:
-                    raise UserError(tx(lang, "e_nolink"))
-            c = await ccfg(cid) or {}
-            lst = c.get("fsub", [])
-            if len(lst) >= 3:
-                raise UserError(tx(lang, "fs_max"))
-            if not any(e["id"] == ch.id for e in lst):
-                lst.append({"id": ch.id, "title": ch.title, "link": link})
-            await db.chats.update_one({"_id": cid}, {"$set": {"fsub": lst}})
-            pending.pop(uid, None)
-            return await show(m, *await fsub_panel(cid, uid))
         if kind in ("delay", "cdelay"):
             lo, hi = sorted(float(x) for x in m.text.split()[:2])
             if lo < 0 or (uid not in OWNERS and (lo < 1 or hi > 300)):
@@ -1564,7 +1482,7 @@ async def on_input(_, m: Message):
             if kind == "delay":
                 await gset(min=lo, max=hi)
                 pending.pop(uid, None)
-                return await show(m, *await delay_panel())
+                return await show(m, *await delay_panel(uid))
             await db.chats.update_one({"_id": st[1]}, {"$set": {"min": lo, "max": hi}}, upsert=True)
             pending.pop(uid, None)
             return await show(m, *await chat_panel(st[1], uid))
@@ -1572,7 +1490,7 @@ async def on_input(_, m: Message):
             check_template(m.text, lang)
             await gset(welcome=m.text, welcome_on=True)
             pending.pop(uid, None)
-            await m.reply("✅ Global welcome text save + ON")
+            await m.reply(tx(lang, "saved_gw"))
             return await show(m, *await main_panel(uid))
         if kind == "cwelcome":
             check_template(m.text, lang)
@@ -1596,60 +1514,10 @@ async def on_input(_, m: Message):
             return await m.reply(f"❌ {e}")
         if kind == "lphone" or isinstance(e, PhoneCodeExpired) or kind == "lstr":
             await cancel_login(uid)
-            return await m.reply(f"❌ {type(e).__name__}: {str(e)[:500]}\nPhir se Login button dabao.")
+            return await m.reply(tx(lang, "ses_fail", err=f"{type(e).__name__}: {str(e)[:500]}"))
         log.exception("input error")
-        detail = f"{type(e).__name__}: {str(e)[:500]}" if uid in OWNERS else "Invalid input"
-        await m.reply(f"❌ {detail}")
-
-
-# ======================= background tasks =======================
-async def gate_cleaner():
-    """Time limit khatam hone par captcha/force-sub wali requests decline."""
-    while True:
-        await asyncio.sleep(120)
-        try:
-            cutoff = time.time() - GATE_MINUTES * 60
-            old = [g async for g in db.gate.find({"ts": {"$lt": cutoff}})]
-            for g in old:
-                await gate_fail(g["chat_id"], g["user_id"], g.get("name"), g.get("username"), "GATE_TIMEOUT")
-                try:
-                    c = await ccfg(g["chat_id"]) or {}
-                    await bot.send_message(g["user_id"], tx(c.get("lang", "hi"), "gate_expired"))
-                except Exception:
-                    pass
-        except Exception:
-            log.exception("gate_cleaner")
-
-async def plan_watcher():
-    """Premium khatam hone par user ko batata hai."""
-    while True:
-        await asyncio.sleep(1800)
-        try:
-            now = time.time()
-            ended = [u async for u in db.users.find({"premium_until": {"$gt": 0, "$lt": now}, "exp_notified": {"$ne": True}})]
-            for u in ended:
-                await db.users.update_one({"_id": u["_id"]}, {"$set": {"exp_notified": True}})
-                try:
-                    await bot.send_message(u["_id"], tx(await lang_of(u["_id"]), "prem_end"))
-                except Exception:
-                    pass
-                await notify_admin(f"⌛ Premium khatam: `{u['_id']}`")
-        except Exception:
-            log.exception("plan_watcher")
-
-async def helper_health():
-    """Helper session mar gaya (logout/revoke) to turant alert."""
-    while True:
-        await asyncio.sleep(1800)
-        if not user:
-            continue
-        try:
-            await user.get_me()
-        except Exception as e:
-            if reason_of(e) in AUTH_DEAD:
-                await helper_died(reason_of(e))
-            else:
-                log.warning("helper health: %s", e)
+        detail = f"{type(e).__name__}: {str(e)[:500]}" if uid in OWNERS else tx(lang, "in_err")
+        await m.reply(tx(lang, "in_err_full", d=detail))
 
 
 # ======================= web server + self ping =======================
@@ -1672,34 +1540,38 @@ async def self_ping():
             except Exception as e:
                 log.warning("ping fail: %s", e)
 
+async def boot_clones():
+    """Restart ke baad saare saved clones wapas chalu."""
+    async for d in CLONES.find({"active": {"$ne": False}}):
+        try:
+            await start_clone(d)
+            log.info("clone started: @%s", d.get("username"))
+        except Exception as e:
+            log.warning("clone %s start fail: %s", d["_id"], type(e).__name__)
+            await CLONES.update_one({"_id": d["_id"]}, {"$set": {"active": False}})
+            try:
+                lang = await run_in(MAIN, lang_of, d["owner_id"])
+                await MAIN.client.send_message(d["owner_id"], tx(lang, "k_failed_boot", u=d.get("username") or d["_id"]))
+            except Exception:
+                pass
+        await asyncio.sleep(1)
+
 async def main():
     await web_app()
-    await bot.start()
-    BOT_ID["id"] = (await bot.get_me()).id
-    try:
-        g = await gcfg()
-        STATE["public"] = bool(g.get("public", False))
-        lc = g.get("log_chat") or (int(ENV_LOG) if ENV_LOG and ENV_LOG.lstrip("-").isdigit() else None)
-        LOG["chat"] = lc
-        async for u in db.users.find({"banned": True}):
-            BANNED.add(u["_id"])
-    except Exception as e:
-        log.warning("settings load fail: %s", e)
-    try:
-        await load_user()
-    except Exception as e:
-        log.warning("session load fail: %s", e)
-        await notify_admin(f"🚨 Helper session start nahi hua: `{type(e).__name__}`. /settings → 🔑 Old-Req Session se dobara login karo.", important=True)
-    for _ in range(WORKERS):
-        asyncio.create_task(worker())
-    for t in (self_ping, gate_cleaner, plan_watcher, helper_health):
-        asyncio.create_task(t())
+    attach(MAIN)
+    await MAIN.client.start()
+    CUR.set(MAIN)                                   # main task ka context = main bot
+    MAIN.bot_id["id"] = (await MAIN.client.get_me()).id
+    await boot_instance(MAIN, WORKERS)
+    asyncio.create_task(self_ping())
+    await boot_clones()
     status = await mongo_status()
-    log.info("Bot started | %s | owners=%s | public=%s", status, sorted(OWNERS), STATE["public"])
-    for oid in OWNERS:
+    log.info("Bot started | %s | owners=%s | public=%s | clones=%s", status, sorted(MAIN.owners), MAIN.state["public"], len(RUNNING))
+    for oid in MAIN.owners:
         try:
-            await bot.send_message(oid, f"🚀 Bot started\n{status}\nMode: {'🌐 Public' if STATE['public'] else '🔒 Private'}"
-                                        f"\nHelper: {'✅' if user else '❌'} | Log: {'✅' if LOG['chat'] else '❌'}")
+            await MAIN.client.send_message(
+                oid, f"🚀 Bot started\n{status}\nMode: {'🌐 Public' if MAIN.state['public'] else '🔒 Private'}"
+                     f"\nHelper: {'✅' if MAIN.user else '❌'} | Clones: {len(RUNNING)}")
         except Exception as e:
             log.warning("owner %s ko msg nahi gaya: %s", oid, e)
     await asyncio.Event().wait()
