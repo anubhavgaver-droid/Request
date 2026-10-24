@@ -22,3 +22,12 @@ Users list, aur **Clone Bot** feature. Har user /start ke baad apni bhasha (ह�
 
 ## Admin commands (main aur clone dono me, apne owner ke liye)
 /settings panel | /public /private mode | /users users list (10/page) | /approveold <id> | /stopold <id> | /ping | /id
+
+## Clone header
+Clone me har user ko (panel aur /start par) dikhta hai: "Ye bot @MainBot ka clone hai, owner: ..." -
+clone owner ise hata nahi sakta.
+
+## Daily report
+Har raat REPORT_HOUR (IST) par bot chat owners ko DM karta hai: aaj kitni requests approve/fail hui (top chats ke saath).
+Admin ko poore bot ka summary milta hai. Sirf unko jaata hai jinke chats par aaj activity hui. Band karne ke liye
+/settings -> 🔔 Daily report. Clone me ye clone ke apne users/chats ke liye alag chalta hai.

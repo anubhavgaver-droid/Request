@@ -1,4 +1,4 @@
-import os, re, asyncio, random, logging, functools, time, contextvars, hashlib, base64
+import os, re, asyncio, random, logging, functools, time, contextvars, hashlib, base64, calendar
 from collections import Counter
 from aiohttp import web, ClientSession
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -35,6 +35,7 @@ CLONE_WORKERS = int(os.environ.get("CLONE_WORKERS", 3))     # har clone ke worke
 MAX_CLONES = int(os.environ.get("MAX_CLONES", 10))          # total clones (RAM bachane ke liye)
 MAX_CHATS = int(os.environ.get("MAX_CHATS_PER_USER", 10))   # public mode me ek user ke max chats
 SECRET_KEY = os.environ.get("SECRET_KEY") or (API_HASH + "|joinbot-v1")
+REPORT_HOUR = int(os.environ.get("REPORT_HOUR", 21))     # daily report ka time (IST, 0-23)
 PAGE = 8
 
 MDB = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)["joinbot"]
@@ -69,6 +70,7 @@ class Inst:
         self.bot_id = {"id": bot_id}
         self.workers = []
         self.username = ""
+        self.owner_name = None      # clone owner ka naam (clone header ke liye)
 
 class P:
     """Module-level naam (db, bot, OWNERS...) ko 'abhi wale bot' ke attribute par bhejta hai."""
@@ -436,6 +438,25 @@ TX = {
  "kv_stop": "⏸ Stop", "kv_start": "▶️ Start", "kz_ask": "⚠️ Delete clone **@{u}**? All its data will be removed.",
 },
 }
+
+TX["hi"].update({
+ "clone_head": "🤖 यह बॉट **@{main}** का **क्लोन** है।\nमालिक: {owner}\n\n",
+ "chat_text": "**{title}**\n`{cid}`\n\nApprove: {on}\nडिले: {lo}-{hi}s {dt}\nवेलकम DM: {w}\n"
+              "Approved: {ap} (आज: {td}) | Failed records: {nf}\nपुरानी task: {old}",
+ "b_report": "🔔 डेली रिपोर्ट {s}", "q_rep_on": "डेली रिपोर्ट चालू", "q_rep_off": "डेली रिपोर्ट बंद",
+ "rep_title": "📊 **आज की रिपोर्ट** ({day})\n\n✅ Approved: {ok}\n❌ Failed: {bad}",
+ "rep_top": "\n\n**टॉप चैट:**\n{lines}", "rep_chat": "• {title}: ✅ {ok} | ❌ {bad}",
+ "rep_foot": "\n\n🔕 बंद करने के लिए: /settings → 🔔 डेली रिपोर्ट",
+})
+TX["en"].update({
+ "clone_head": "🤖 This bot is a **clone** of **@{main}**.\nOwner: {owner}\n\n",
+ "chat_text": "**{title}**\n`{cid}`\n\nApprove: {on}\nDelay: {lo}-{hi}s {dt}\nWelcome DM: {w}\n"
+              "Approved: {ap} (today: {td}) | Failed records: {nf}\nOld task: {old}",
+ "b_report": "🔔 Daily report {s}", "q_rep_on": "Daily report ON", "q_rep_off": "Daily report OFF",
+ "rep_title": "📊 **Today's report** ({day})\n\n✅ Approved: {ok}\n❌ Failed: {bad}",
+ "rep_top": "\n\n**Top chats:**\n{lines}", "rep_chat": "• {title}: ✅ {ok} | ❌ {bad}",
+ "rep_foot": "\n\n🔕 To turn off: /settings → 🔔 Daily report",
+})
 REASON_EMOJI = {"USER_CHANNELS_TOO_MUCH": "🚫", "USER_DEACTIVATED": "👻", "USER_DEACTIVATED_BAN": "⛔",
                 "HIDE_REQUESTER_MISSING": "↩️", "USER_ALREADY_PARTICIPANT": "✔️", "USER_BANNED_IN_CHANNEL": "🔨",
                 "USER_PRIVACY_RESTRICTED": "🔒", "USER_ID_INVALID": "❓", "CHAT_ADMIN_REQUIRED": "🔑"}
@@ -460,12 +481,31 @@ def fmt_ts(ts) -> str:
     return time.strftime("%d %b %y, %H:%M", time.gmtime(float(ts) + 19800)) + " IST"
 
 
+def day_key(ts=None) -> str:
+    """IST din ki key, jaise 20261024."""
+    return time.strftime("%Y%m%d", time.gmtime((ts or time.time()) + 19800))
+
+def day_start(day: str) -> float:
+    return calendar.timegm(time.strptime(day, "%Y%m%d")) - 19800
+
+def hour_ist() -> int:
+    return time.gmtime(time.time() + 19800).tm_hour
+
+
 class UserError(Exception):
     """User ko seedha dikhne wala saaf error."""
 
 
 def mention(name, uid):
     return f"[{clean(name or uid)}](tg://user?id={uid})"
+
+def clone_head(lang: str) -> str:
+    """Clone me har user ko dikhne wala 'ye bot clone hai' header (clone owner hata nahi sakta)."""
+    inst = CUR.get()
+    if not inst.is_clone:
+        return ""
+    owner = mention(inst.owner_name or inst.clone_owner, inst.clone_owner)
+    return tx(lang, "clone_head", main=MAIN.username or "main_bot", owner=owner)
 
 def helper_note(lang="hi"):
     if not helper:
@@ -613,7 +653,7 @@ async def worker():
                     break
                 except FloodWait as e:
                     await asyncio.sleep(e.value + 1)
-            await db.chats.update_one({"_id": cid}, {"$inc": {"approved": 1}})
+            await db.chats.update_one({"_id": cid}, {"$inc": {"approved": 1, f"daily.{day_key()}": 1}})
             await db.settings.update_one({"_id": "global"}, {"$inc": {"total": 1}}, upsert=True)
             await clear_fail(cid, uid)
             if cfg["welcome_on"]:
@@ -720,7 +760,7 @@ async def approve_old(cid: int, notify: int):
                     try:
                         await user.approve_chat_join_request(cid, u.id)
                         done += 1
-                        await db.chats.update_one({"_id": cid}, {"$inc": {"approved": 1}}, upsert=True)
+                        await db.chats.update_one({"_id": cid}, {"$inc": {"approved": 1, f"daily.{day_key()}": 1}}, upsert=True)
                         await clear_fail(cid, u.id)
                         break
                     except FloodWait as e:
@@ -788,11 +828,12 @@ async def show(x, text, markup):
 async def main_panel(uid: int):
     g = await gcfg()
     lang = await lang_of(uid)
+    rep_on = ((await db.users.find_one({"_id": uid})) or {}).get("report", True)
     if uid in OWNERS:
         pub = STATE["public"]
         hs = ("✅ " + clean(helper["name"])) if helper else "❌"
         hint = tx(lang, "hint_pub") if (helper or not IS_CLONE) else tx(lang, "hint_nohelper")
-        text = tx(lang, "admin_main", tag=tx(lang, "tag_clone") if IS_CLONE else "",
+        text = clone_head(lang) + tx(lang, "admin_main", tag=tx(lang, "tag_clone") if IS_CLONE else "",
                   mode=tx(lang, "mode_pub" if pub else "mode_priv"), lo=g["min"], hi=g["max"],
                   q=queue.qsize(), tot=g.get("total", 0), hs=hs, hint=hint)
         kb = [[B(tx(lang, "b_active", s=tick(g["active"])), callback_data="g:active")],
@@ -804,17 +845,19 @@ async def main_panel(uid: int):
               [B(tx(lang, "b_users"), callback_data="us:0"), B(tx(lang, "lang_btn"), callback_data="lang")]]
         if not IS_CLONE:
             kb.append([B(tx(lang, "myclone_btn"), callback_data="k"), B(tx(lang, "b_clones_admin"), callback_data="ka:0")])
+        kb.append([B(tx(lang, "b_report", s=tick(rep_on)), callback_data="rep")])
         kb.append([B(tx(lang, "refresh"), callback_data="main")])
     else:
         n, tot = 0, 0
         async for c in db.chats.find({"owner_id": uid}):
             n += 1
             tot += c.get("approved", 0)
-        text = tx(lang, "user_main", n=n, tot=tot)
+        text = clone_head(lang) + tx(lang, "user_main", n=n, tot=tot)
         kb = [[B(tx(lang, "my_chats"), callback_data="chats"), B(tx(lang, "add_chat"), callback_data="add")],
               [B(tx(lang, "old_help_btn"), callback_data="oh")]]
         if not IS_CLONE:
             kb.append([B(tx(lang, "myclone_btn"), callback_data="k")])
+        kb.append([B(tx(lang, "b_report", s=tick(rep_on)), callback_data="rep")])
         kb.append([B(tx(lang, "lang_btn"), callback_data="lang"), B(tx(lang, "refresh"), callback_data="main")])
     return text, InlineKeyboardMarkup(kb)
 
@@ -845,7 +888,8 @@ async def chat_panel(cid: int, uid: int):
     nfail = await db.fails.count_documents({"chat_id": cid})
     text = tx(lang, "chat_text", title=clean(c.get("title", cid)), cid=cid, on=tick(on), lo=lo, hi=hi,
               dt=tx(lang, "custom") if "min" in c else tx(lang, "global"), w=tick(w_on),
-              ap=c.get("approved", 0), nf=nfail, old=tx(lang, "running") if running else tx(lang, "idle"))
+              ap=c.get("approved", 0), td=(c.get("daily") or {}).get(day_key(), 0), nf=nfail,
+              old=tx(lang, "running") if running else tx(lang, "idle"))
     kb = InlineKeyboardMarkup([
         [B(tx(lang, "b_approve", s=tick(on)), callback_data=f"ct:{cid}")],
         [B(tx(lang, "b_cdelay"), callback_data=f"cd:{cid}"), B(tx(lang, "b_reset"), callback_data=f"cr:{cid}")],
@@ -991,6 +1035,66 @@ async def clone_detail_panel(uid: int, bid: int):
             [B(tx(lang, "back"), callback_data="ka:0")]]
     return text, InlineKeyboardMarkup(rows)
 
+# ======================= daily report =======================
+async def send_daily_report(day: str):
+    """Aaj ka approved/failed summary: chat owners ko apne chats ka, admin ko sabka."""
+    start_ts = day_start(day)
+    bad_by_chat = Counter()
+    async for f in db.fails.find({"ts": {"$gte": start_ts, "$lt": start_ts + 86400}}):
+        bad_by_chat[f["chat_id"]] += 1
+    buckets = {}
+    async for c in db.chats.find({}):
+        ok_n = (c.get("daily") or {}).get(day, 0)
+        bad = bad_by_chat.get(c["_id"], 0)
+        if not ok_n and not bad:
+            continue
+        item = (clean(c.get("title") or c["_id"]), ok_n, bad)
+        oid = c.get("owner_id")
+        targets = set(OWNERS) | ({oid} if oid is not None else set())
+        for t in targets:
+            buckets.setdefault(t, []).append(item)
+    sent = 0
+    for uid, items in buckets.items():
+        if ((await db.users.find_one({"_id": uid})) or {}).get("report", True) is False:
+            continue
+        lang = await lang_of(uid)
+        top = sorted(items, key=lambda x: (-x[1], -x[2]))[:5]
+        text = tx(lang, "rep_title", day=f"{day[6:]}-{day[4:6]}-{day[:4]}", ok=sum(i[1] for i in items), bad=sum(i[2] for i in items))
+        text += tx(lang, "rep_top", lines="\n".join(tx(lang, "rep_chat", title=t, ok=o, bad=b) for t, o, b in top))
+        text += tx(lang, "rep_foot")
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            pass
+    # purane din ke counters saaf (8 din se purane)
+    cutoff = day_key(time.time() - 8 * 86400)
+    async for c in db.chats.find({}):
+        old = [k for k in (c.get("daily") or {}) if k < cutoff]
+        if old:
+            await db.chats.update_one({"_id": c["_id"]}, {"$unset": {f"daily.{k}": "" for k in old}})
+    return sent
+
+async def report_tick() -> bool:
+    day = day_key()
+    if hour_ist() >= REPORT_HOUR and (await gcfg()).get("last_report") != day:
+        await gset(last_report=day)          # pehle mark: double send na ho
+        await send_daily_report(day)
+        return True
+    return False
+
+async def report_loop():
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await report_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("report_loop")
+        await asyncio.sleep(300)
+
+
 async def boot_instance(inst, workers: int):
     """Bot (main ya clone) ki settings + helper session load karke workers chalata hai."""
     try:
@@ -1003,6 +1107,7 @@ async def boot_instance(inst, workers: int):
         log.warning("session load fail (%s): %s", inst.key, e)
     for _ in range(workers):
         inst.workers.append(asyncio.create_task(worker()))
+    inst.workers.append(asyncio.create_task(report_loop()))
 
 async def start_clone(doc: dict):
     bid = int(doc["_id"])
@@ -1014,6 +1119,7 @@ async def start_clone(doc: dict):
     key = f"clone{bid}"
     client = Client(key, api_id=API_ID, api_hash=API_HASH, bot_token=token, in_memory=True)
     inst = Inst(key, client, {int(doc["owner_id"])}, Store(f"c{bid}_"), clone_owner=int(doc["owner_id"]), bot_id=bid)
+    inst.owner_name = doc.get("owner_name")
     INSTANCES[key] = inst
     attach(inst)
     try:
@@ -1049,7 +1155,7 @@ async def delete_clone(bid: int):
     await Store(f"c{bid}_").drop()
     await CLONES.delete_one({"_id": bid})
 
-async def create_clone(uid: int, token: str, lang: str):
+async def create_clone(uid: int, token: str, lang: str, owner_name: str = None):
     g = await gcfg()
     if not g.get("clone_on", True) and uid not in OWNERS:
         raise UserError(tx(lang, "k_off"))
@@ -1064,7 +1170,7 @@ async def create_clone(uid: int, token: str, lang: str):
         raise UserError(tx(lang, "k_one"))
     if await CLONES.count_documents({}) >= MAX_CLONES:
         raise UserError(tx(lang, "k_full"))
-    doc = {"_id": bid, "owner_id": uid, "token": enc(token), "created": time.time(), "active": True}
+    doc = {"_id": bid, "owner_id": uid, "owner_name": owner_name, "token": enc(token), "created": time.time(), "active": True}
     try:
         inst = await start_clone(doc)
     except Exception as e:
@@ -1083,7 +1189,7 @@ async def start(_, m: Message):
     await touch_user(m.from_user)
     lang = await lang_of(uid)
     if uid not in OWNERS and not STATE["public"]:
-        return await m.reply(tx(lang, "private_bot", uid=uid))
+        return await m.reply(clone_head(lang) + tx(lang, "private_bot", uid=uid))
     await cancel_login(uid)
     await show(m, *await main_panel(uid))
 
@@ -1218,6 +1324,11 @@ async def cb(_, q: CallbackQuery):
             return await show(q, *await main_panel(uid))
         if act == "lang":
             await set_lang(uid, "en" if lang == "hi" else "hi")
+            return await show(q, *await main_panel(uid))
+        if act == "rep":
+            cur = ((await db.users.find_one({"_id": uid})) or {}).get("report", True)
+            await db.users.update_one({"_id": uid}, {"$set": {"report": not cur}}, upsert=True)
+            await q.answer(tx(lang, "q_rep_off" if cur else "q_rep_on"))
             return await show(q, *await main_panel(uid))
         if act == "g":
             g = await gcfg()
@@ -1421,7 +1532,7 @@ async def on_input(_, m: Message):
             pending.pop(uid, None)
             wait = await m.reply(tx(lang, "k_wait"))
             try:
-                inst = await create_clone(uid, token, lang)
+                inst = await create_clone(uid, token, lang, m.from_user.first_name)
             finally:
                 await try_delete(wait)
             return await m.reply(tx(lang, "k_done", u=inst.username),
@@ -1561,7 +1672,8 @@ async def main():
     attach(MAIN)
     await MAIN.client.start()
     CUR.set(MAIN)                                   # main task ka context = main bot
-    MAIN.bot_id["id"] = (await MAIN.client.get_me()).id
+    me = await MAIN.client.get_me()
+    MAIN.bot_id["id"], MAIN.username = me.id, me.username
     await boot_instance(MAIN, WORKERS)
     asyncio.create_task(self_ping())
     await boot_clones()
