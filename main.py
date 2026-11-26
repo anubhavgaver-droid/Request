@@ -503,6 +503,7 @@ TX["hi"].update({
  "member_added": "✅ **{title}** जुड़ गया!{warn}\n\n{note}\n\n⚙️ सेटिंग्स: /settings → 📺 मेरे चैट",
  "warn_noinvite": "\n\n⚠️ बॉट को \"Invite Users\" permission नहीं मिली, इसके बिना रिक्वेस्ट approve नहीं होंगी।",
  "old_prog": "⏳ `{cid}` → अब तक {n} approve हो गए...",
+ "old_left": "🚪 काम पूरा होते ही Helper अकाउंट को चैट से हटा दिया गया।",
  "ah_wait": "⏳ Helper को जोड़ रहा हूँ...",
  "ah_ok": "🤝 Helper {who} **अपने-आप admin बन गया** ✅ (Invite Users permission के साथ)।",
  "ah_have": "🤝 Helper {who} पहले से इस चैट में admin है ✅",
@@ -546,6 +547,7 @@ TX["en"].update({
  "member_added": "✅ **{title}** added!{warn}\n\n{note}\n\n⚙️ Settings: /settings → 📺 My Chats",
  "warn_noinvite": "\n\n⚠️ The bot lacks \"Invite Users\" permission, so requests won't be approved.",
  "old_prog": "⏳ `{cid}` → {n} approved so far...",
+ "old_left": "🚪 Helper account was removed from the chat as soon as the job finished.",
  "ah_wait": "⏳ Adding the helper...",
  "ah_ok": "🤝 Helper {who} **became admin automatically** ✅ (with Invite Users permission).",
  "ah_have": "🤝 Helper {who} is already an admin in this chat ✅",
@@ -886,6 +888,8 @@ async def helper_status(cid: int) -> str:
         m = await user.get_chat_member(cid, "me")
     except Exception:
         return "notmember"
+    if m.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+        return "notmember"
     if m.status == ChatMemberStatus.OWNER:
         return "ok"
     if m.status == ChatMemberStatus.ADMINISTRATOR:
@@ -982,6 +986,15 @@ def fail_summary(cnt: Counter, lang: str = "hi") -> str:
         lines.append(f"{e} **×{n}** — {d}")
     return "\n".join(lines)
 
+async def helper_leave(cid: int) -> bool:
+    """Kaam ho gaya: helper account khud chat chhod deta hai (agli baar bot phir se auto-add kar lega)."""
+    try:
+        await tg_call(user.leave_chat, cid, gate="uflood_until")
+        return True
+    except Exception as e:
+        log.warning("helper leave fail %s: %s", cid, reason_of(e))
+        return False
+
 async def approve_old(cid: int, notify: int):
     """Purani requests: OLD_BATCH (default 12) ek saath approve. Delay > 0 ho to batch ke beech me rukta hai."""
     lang = await lang_of(notify)
@@ -1026,14 +1039,19 @@ async def approve_old(cid: int, notify: int):
                     buf = []
             if buf:
                 await flush(buf)
+        left = await helper_leave(cid)
         text = tx(lang, "old_done", cid=cid, ok=done, bad=sum(fails.values()))
         if fails:
             text += "\n\n" + fail_summary(fails, lang) + tx(lang, "old_detail")
+        if left:
+            text += "\n\n" + tx(lang, "old_left")
         await bot.send_message(notify, text)
     except asyncio.CancelledError:
-        await bot.send_message(notify, tx(lang, "old_stopped", cid=cid, ok=done))
+        left = await helper_leave(cid)
+        await bot.send_message(notify, tx(lang, "old_stopped", cid=cid, ok=done) + (("\n\n" + tx(lang, "old_left")) if left else ""))
     except Exception as e:
-        await bot.send_message(notify, tx(lang, "old_err", cid=cid, e=f"{type(e).__name__}: {e}"))
+        left = await helper_leave(cid)
+        await bot.send_message(notify, tx(lang, "old_err", cid=cid, e=f"{type(e).__name__}: {e}") + (("\n\n" + tx(lang, "old_left")) if left else ""))
     finally:
         old_tasks.pop(cid, None)
 
