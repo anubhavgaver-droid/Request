@@ -917,12 +917,22 @@ async def ensure_helper(cid: int):
         if st == "notmember":                       # pehle helper ko ek-baar-wale link se join karao
             link = None
             try:
-                link = await tg_call(bot.create_chat_invite_link, cid, name="helper-auto", member_limit=1,
-                                     expire_date=datetime.now() + timedelta(minutes=10))
-                try:
-                    await tg_call(user.join_chat, link.invite_link, gate="uflood_until")
-                except Exception as e:
-                    if reason_of(e) != "USER_ALREADY_PARTICIPANT":
+                for attempt in (1, 2):                  # expiry nahi lagate: link join ke turant baad revoke hota hai
+                    link = await tg_call(bot.create_chat_invite_link, cid, name="helper-auto", member_limit=1)
+                    try:
+                        await tg_call(user.join_chat, link.invite_link, gate="uflood_until")
+                        break
+                    except Exception as e:
+                        rid = reason_of(e)
+                        if rid == "USER_ALREADY_PARTICIPANT":
+                            break
+                        if rid in ("INVITE_HASH_EXPIRED", "INVITE_HASH_INVALID") and attempt == 1:
+                            try:
+                                await bot.revoke_chat_invite_link(cid, link.invite_link)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(1)
+                            continue                    # naya link bana kar ek baar aur
                         raise
             except Exception as e:
                 return "join_fail", reason_of(e)
