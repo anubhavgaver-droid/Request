@@ -1,4 +1,4 @@
-import os, re, asyncio, random, logging, functools, time, contextvars, hashlib, base64, calendar
+import os, re, asyncio, random, logging, functools, time, contextvars, hashlib, base64, calendar, unicodedata
 from collections import Counter
 from datetime import datetime, timedelta
 from aiohttp import web, ClientSession
@@ -14,7 +14,7 @@ from pyrogram.errors import (FloodWait, RPCError, MessageNotModified, SessionPas
 from pyrogram.handlers import (MessageHandler, CallbackQueryHandler, ChatJoinRequestHandler,
                                ChatMemberUpdatedHandler)
 from pyrogram.types import (ChatJoinRequest, Message, CallbackQuery, ChatPrivileges,
-                            InlineKeyboardMarkup, InlineKeyboardButton as B)
+                            InlineKeyboardMarkup, InlineKeyboardButton as _IB)
 try:
     from cryptography.fernet import Fernet
 except Exception:  # cryptography na ho to tokens/sessions plain store honge (requirements.txt me hai)
@@ -38,8 +38,34 @@ MAX_CHATS = int(os.environ.get("MAX_CHATS_PER_USER", 10))   # public mode me ek 
 SECRET_KEY = os.environ.get("SECRET_KEY") or (API_HASH + "|joinbot-v1")
 REPORT_HOUR = int(os.environ.get("REPORT_HOUR", 21))     # daily report ka time (IST, 0-23)
 PAGE = 8
+VERSION = "3.0"
 OLD_BATCH = int(os.environ.get("OLD_BATCH", 12))         # purani requests: ek saath kitni approve (10-12)
 TG_WORKERS = int(os.environ.get("TG_WORKERS", 32))       # Pyrogram ke update handlers (parallel)
+
+# ---- simple buttons: plain text + colour dot  (🟢 on/selected · 🔵 action · 🔴 danger)
+_DANGER = {"cx", "cs", "cz", "kd", "kdy", "kz", "kzy", "lo", "fc"}
+_NOPAINT = {"p", "us", "ka", "noop"}                 # page arrows / page counter
+
+def _plain(t: str) -> str:
+    i = 0
+    while i < len(t) and (t[i] in " \ufe0f\u200d" or unicodedata.category(t[i]).startswith("S")):
+        i += 1
+    return t[i:] or t
+
+def B(text, callback_data=None, **kw):
+    if callback_data is not None:
+        act = callback_data.split(":", 1)[0]
+        if text[:1] in ("🟢", "🔵", "🔴", "‹", "↻") or act in _NOPAINT:
+            pass
+        elif "🟢" in text or "🔴" in text:                      # toggle: colour already in the ON/OFF text
+            text = _plain(text)
+        else:
+            text = ("🔴 " if act in _DANGER else "🔵 ") + _plain(text)
+    return _IB(text, callback_data=callback_data, **kw)
+
+def lang_row(lang: str):
+    return [B("🟢 ✔ हिंदी" if lang == "hi" else "🔵 हिंदी", callback_data="lang:hi"),
+            B("🟢 ✔ English" if lang == "en" else "🔵 English", callback_data="lang:en")]
 
 MDB = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=8000)["joinbot"]
 
@@ -503,6 +529,9 @@ TX["hi"].update({
  "member_added": "✅ **{title}** जुड़ गया!{warn}\n\n{note}\n\n⚙️ सेटिंग्स: /settings → 📺 मेरे चैट",
  "warn_noinvite": "\n\n⚠️ बॉट को \"Invite Users\" permission नहीं मिली, इसके बिना रिक्वेस्ट approve नहीं होंगी।",
  "old_prog": "⏳ `{cid}` → अब तक {n} approve हो गए...",
+ "old_pb": "**🕰 पुरानी रिक्वेस्ट Approve हो रही हैं**\n`{cid}`\n\n📋 कुल रिक्वेस्ट: **{total}**\n\n{spin} {bar} **{pct}%**\n\n✅ Approved: **{done}** / {total}\n❌ Failed: {bad}\n⚡ स्पीड: {rate}/सेकंड\n⏱ बचा समय: {eta}",
+ "old_count": "🔍 पुरानी रिक्वेस्ट गिन रहा हूँ...",
+ "old_none": "ℹ️ इस चैट में कोई pending रिक्वेस्ट नहीं मिली।",
  "old_left": "🚪 काम पूरा होते ही Helper अकाउंट को चैट से हटा दिया गया।",
  "ah_wait": "⏳ Helper को जोड़ रहा हूँ...",
  "ah_ok": "🤝 Helper {who} **अपने-आप admin बन गया** ✅ (Invite Users permission के साथ)।",
@@ -547,6 +576,9 @@ TX["en"].update({
  "member_added": "✅ **{title}** added!{warn}\n\n{note}\n\n⚙️ Settings: /settings → 📺 My Chats",
  "warn_noinvite": "\n\n⚠️ The bot lacks \"Invite Users\" permission, so requests won't be approved.",
  "old_prog": "⏳ `{cid}` → {n} approved so far...",
+ "old_pb": "**🕰 Approving old requests**\n`{cid}`\n\n📋 Total requests: **{total}**\n\n{spin} {bar} **{pct}%**\n\n✅ Approved: **{done}** / {total}\n❌ Failed: {bad}\n⚡ Speed: {rate}/sec\n⏱ Time left: {eta}",
+ "old_count": "🔍 Counting old requests...",
+ "old_none": "ℹ️ No pending requests found in this chat.",
  "old_left": "🚪 Helper account was removed from the chat as soon as the job finished.",
  "ah_wait": "⏳ Adding the helper...",
  "ah_ok": "🤝 Helper {who} **became admin automatically** ✅ (with Invite Users permission).",
@@ -554,6 +586,113 @@ TX["en"].update({
  "ah_bot_noperm": "⚠️ To make the helper admin automatically, the bot also needs the **Add New Admins** permission.\n\n"
                   "Turn it ON in the bot's admin permissions, then press **🤝 Make Helper Admin**.",
  "ah_fail": "⚠️ Couldn't make the helper admin automatically.\nReason: `{rid}`",
+})
+_SC = dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ"))
+def sc(t: str) -> str:
+    """English text -> small caps (sirf headings/labels ke liye)."""
+    return "".join(_SC.get(ch.lower(), ch) if ch.isascii() and ch.isalpha() else ch for ch in t)
+
+TX["hi"].update({
+ "back": "‹ वापस", "refresh": "↻ रीफ्रेश", "help_btn": "मदद", "open_panel": "पैनल खोलो",
+ "mode_pub": "Public", "mode_priv": "Private", "hs_none": "❌ जुड़ा नहीं",
+ "my_chats": "मेरे चैट", "add_chat": "चैट जोड़ो", "myclone_btn": "क्लोन बॉट", "b_clones_admin": "क्लोन (Admin)",
+ "b_active": "बॉट: {s}", "b_autoall": "सभी चैट Auto-approve: {s}", "b_wg": "वेलकम (सभी): {s}",
+ "b_chats": "सभी चैट", "b_gdelay": "स्पीड", "b_gwtext": "वेलकम टेक्स्ट", "b_sess": "Helper login",
+ "b_mode": "मोड: {m}", "b_users": "यूज़र्स", "b_report": "डेली रिपोर्ट: {s}",
+ "b_approve": "Approve: {s}", "b_cdelay": "स्पीड", "b_reset": "रीसेट", "b_wdm": "वेलकम DM: {s}",
+ "b_wtext": "वेलकम टेक्स्ट", "b_old": "पुरानी रिक्वेस्ट Approve", "b_oldstop": "रोको",
+ "b_fail": "Failed रिपोर्ट", "b_help": "Helper जानकारी", "b_rm": "चैट हटाओ", "b_ah": "Helper जोड़ो",
+ "b_custom": "कस्टम", "d_instant": "तुरंत (0s)",
+ "dly_instant": "⚡ तुरंत", "dly_range": "{lo}-{hi} सेकंड",
+ "hint_pub": "", "hint_nohelper": "\n\n⚠️ Helper जुड़ा नहीं — पुरानी रिक्वेस्ट के लिए Helper login करो।",
+ "user_main": "**ऑटो जॉइन रिक्वेस्ट बॉट**\nजॉइन रिक्वेस्ट अपने-आप approve होती हैं।\n\n"
+              "चैट › **{n}**\nApproved › **{tot}**\n\nशुरू करने के लिए बॉट को अपने चैनल/ग्रुप में **सभी permissions** के साथ admin बनाओ।",
+ "admin_main": "**ऑटो जॉइन रिक्वेस्ट बॉट** · Admin{tag}\n━━━━━━━━━━━━\nमोड › {mode}\nस्पीड › {dly}\n"
+               "कतार › {q}\nApproved › {tot}\nHelper › {hs}{hint}",
+ "chat_text": "**📺 {title}**\n`{cid}`\n━━━━━━━━━━━━\nApprove › {on}\nस्पीड › {dly} {dt}\nवेलकम DM › {w}\n"
+              "Approved › **{ap}** (आज {td})\nFailed › {nf}\nपुरानी रिक्वेस्ट › {old}",
+ "dl_title": "**स्पीड (सभी चैट)**\nअभी › {dly}\n\nतुरंत = बिना रुके approve।",
+ "cq_title": "**स्पीड · {title}**\nअभी › {dly} {dt}",
+ "old_pb": "**पुरानी रिक्वेस्ट Approve हो रही हैं**\n`{cid}`\n\n{spin} {bar} **{pct}%**\n\n"
+           "कुल › {total}\nApproved › **{done}**\nFailed › {bad}\nस्पीड › {rate}/सेकंड\nबचा समय › {eta}",
+ "ah_bot_noperm": "⚠️ पहले बॉट को इस चैट में **सभी permissions** के साथ admin बनाओ (खासकर **Add New Admins** और **Invite Users**), फिर दोबारा दबाओ।",
+ "e_bot_not_admin": "⚠️ बॉट इस चैट में admin नहीं है। पहले बॉट को **सभी permissions** के साथ admin बनाओ।",
+ "h_retry": "",
+ "help_user": "**मदद**\nबॉट को चैट में सभी permissions के साथ admin बनाओ। नई जॉइन रिक्वेस्ट अपने-आप approve होती हैं।\n\n"
+              "**बटन क्या करते हैं**\n"
+              "• **मेरे चैट** – आपके चैट और उनकी सेटिंग\n"
+              "• **चैट जोड़ो** – ID / @username से चैट जोड़ो\n"
+              "• **Approve** – auto-approve चालू/बंद\n"
+              "• **स्पीड** – approve से पहले की देरी (तुरंत = बिना रुके)\n"
+              "• **वेलकम DM** – नए मेंबर को जाने वाला मैसेज\n"
+              "• **पुरानी रिक्वेस्ट Approve** – सारी pending रिक्वेस्ट approve\n"
+              "• **Helper जोड़ो** – helper अकाउंट को admin बनाता है (अपने-आप भी होता है)\n"
+              "• **Failed रिपोर्ट** – जो रिक्वेस्ट approve नहीं हुईं\n"
+              "• **चैट हटाओ** – इस चैट को मैनेज करना बंद\n\n"
+              "🟢 चालू/चुना हुआ · 🔵 एक्शन · 🔴 बंद/डेंजर",
+ "help_admin": "\n\n**Admin बटन**\n"
+               "• **बॉट** – पूरा बॉट चालू/बंद\n"
+               "• **सभी चैट Auto-approve** – जोड़े बिना भी हर चैट approve\n"
+               "• **वेलकम (सभी)** – सभी चैट का डिफ़ॉल्ट वेलकम\n"
+               "• **Helper login** – helper अकाउंट लॉगिन\n"
+               "• **मोड** – Public (सब) / Private (सिर्फ admin)\n"
+               "• **यूज़र्स / क्लोन बॉट** – यूज़र और क्लोन मैनेज",
+ "restart_msg": "🟢 **बॉट रीस्टार्ट हो गया**\n━━━━━━━━━━━━\nवर्ज़न › `v{ver}`\nस्टेटस › 🟢 Online\nमोड › {mode}\n"
+                "स्पीड › {dly}\nHelper › {hs}\nडेटाबेस › {db}\nक्लोन › {clones}\nसमय › {t} UTC",
+})
+TX["en"].update({
+ "back": "‹ Back", "refresh": "↻ Refresh", "help_btn": "Help", "open_panel": "Open panel",
+ "mode_pub": "Public", "mode_priv": "Private", "hs_none": "❌ Not connected",
+ "my_chats": "My chats", "add_chat": "Add chat", "myclone_btn": "Clone bot", "b_clones_admin": "Clones (Admin)",
+ "b_active": "Bot: {s}", "b_autoall": "Auto-approve all chats: {s}", "b_wg": "Welcome (all): {s}",
+ "b_chats": "All chats", "b_gdelay": "Speed", "b_gwtext": "Welcome text", "b_sess": "Helper login",
+ "b_mode": "Mode: {m}", "b_users": "Users", "b_report": "Daily report: {s}",
+ "b_approve": "Approve: {s}", "b_cdelay": "Speed", "b_reset": "Reset", "b_wdm": "Welcome DM: {s}",
+ "b_wtext": "Welcome text", "b_old": "Approve old requests", "b_oldstop": "Stop",
+ "b_fail": "Failed report", "b_help": "Helper info", "b_rm": "Remove chat", "b_ah": "Add helper",
+ "b_custom": "Custom", "d_instant": "Instant (0s)",
+ "dly_instant": "⚡ Instant", "dly_range": "{lo}-{hi} sec",
+ "hint_pub": "", "hint_nohelper": "\n\n⚠️ No helper — log in a helper account for old requests.",
+ "user_main": "**" + sc("auto join request bot") + "**\nApproves join requests automatically.\n\n"
+              + sc("chats") + " › **{n}**\n" + sc("approved") + " › **{tot}**\n\n"
+              "To start, make the bot an admin in your channel/group with **all permissions**.",
+ "admin_main": "**" + sc("auto join request bot") + "** · Admin{tag}\n━━━━━━━━━━━━\n" + sc("mode") + " › {mode}\n"
+               + sc("speed") + " › {dly}\n" + sc("queue") + " › {q}\n" + sc("approved") + " › {tot}\n"
+               + sc("helper") + " › {hs}{hint}",
+ "chat_text": "**📺 {title}**\n`{cid}`\n━━━━━━━━━━━━\n" + sc("approve") + " › {on}\n" + sc("speed") + " › {dly} {dt}\n"
+              + sc("welcome dm") + " › {w}\n" + sc("approved") + " › **{ap}** (today {td})\n"
+              + sc("failed") + " › {nf}\n" + sc("old requests") + " › {old}",
+ "dl_title": "**" + sc("speed (all chats)") + "**\n" + sc("now") + " › {dly}\n\nInstant = approve with no wait.",
+ "cq_title": "**" + sc("speed") + " · {title}**\n" + sc("now") + " › {dly} {dt}",
+ "old_pb": "**" + sc("approving old requests") + "**\n`{cid}`\n\n{spin} {bar} **{pct}%**\n\n"
+           + sc("total") + " › {total}\n" + sc("approved") + " › **{done}**\n" + sc("failed") + " › {bad}\n"
+           + sc("speed") + " › {rate}/sec\n" + sc("time left") + " › {eta}",
+ "ah_bot_noperm": "⚠️ First make the bot an admin in this chat with **all permissions** (especially **Add New Admins** and **Invite Users**), then press again.",
+ "e_bot_not_admin": "⚠️ The bot isn't an admin in this chat. Make it admin with **all permissions** first.",
+ "h_retry": "",
+ "help_user": "**" + sc("help") + "**\nMake the bot admin in your chat with all permissions. New join requests are approved automatically.\n\n"
+              "**" + sc("what the buttons do") + "**\n"
+              "• **My chats** – your chats and their settings\n"
+              "• **Add chat** – add a chat by ID / @username\n"
+              "• **Approve** – auto-approve on / off\n"
+              "• **Speed** – wait before approving (Instant = no wait)\n"
+              "• **Welcome DM** – message sent to the new member\n"
+              "• **Approve old requests** – approves every pending request\n"
+              "• **Add helper** – makes the helper account admin (also automatic)\n"
+              "• **Failed report** – requests that could not be approved\n"
+              "• **Remove chat** – stop managing this chat\n\n"
+              "🟢 on / selected · 🔵 action · 🔴 off / danger",
+ "help_admin": "\n\n**" + sc("admin buttons") + "**\n"
+               "• **Bot** – whole bot on / off\n"
+               "• **Auto-approve all chats** – approve even chats not added here\n"
+               "• **Welcome (all)** – default welcome for all chats\n"
+               "• **Helper login** – log in the helper account\n"
+               "• **Mode** – Public (everyone) / Private (admins only)\n"
+               "• **Users / Clone bot** – manage users and clones",
+ "restart_msg": "🟢 **" + sc("bot restarted") + "**\n━━━━━━━━━━━━\n" + sc("version") + " › `v{ver}`\n"
+                + sc("status") + " › 🟢 Online\n" + sc("mode") + " › {mode}\n" + sc("speed") + " › {dly}\n"
+                + sc("helper") + " › {hs}\n" + sc("database") + " › {db}\n" + sc("clones") + " › {clones}\n"
+                + sc("time") + " › {t} UTC",
 })
 REASON_EMOJI = {"USER_CHANNELS_TOO_MUCH": "🚫", "USER_DEACTIVATED": "👻", "USER_DEACTIVATED_BAN": "⛔",
                 "HIDE_REQUESTER_MISSING": "↩️", "USER_ALREADY_PARTICIPANT": "✔️", "USER_BANNED_IN_CHANNEL": "🔨",
@@ -965,7 +1104,7 @@ def ah_message(code, detail, lang):
     if code == "bot_notadmin":
         return tx(lang, "e_bot_not_admin")
     if code == "bot_noperm":
-        return tx(lang, "ah_bot_noperm") + "\n\n" + helper_note(lang)
+        return tx(lang, "ah_bot_noperm")
     return tx(lang, "ah_fail", rid=detail or code) + "\n\n" + helper_note(lang)
 
 async def old_precheck(cid: int, lang: str):
@@ -995,14 +1134,53 @@ async def helper_leave(cid: int) -> bool:
         log.warning("helper leave fail %s: %s", cid, reason_of(e))
         return False
 
+BAR_SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+def pbar(pct: float, tick: int, width: int = 20) -> str:
+    """Animated progress bar: bhara hissa + chamakta hua aage ka kinara."""
+    n = min(width, int(pct / 100 * width))
+    edge = ("▓" if tick % 2 else "▒") if n < width else ""
+    return "█" * n + edge + "░" * (width - n - len(edge))
+
+def fmt_eta(sec: int) -> str:
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60}s"
+    return f"{sec // 3600}h {(sec % 3600) // 60}m"
+
 async def approve_old(cid: int, notify: int):
-    """Purani requests: OLD_BATCH (default 12) ek saath approve. Delay > 0 ho to batch ke beech me rukta hai."""
+    """Purani requests: pehle total ginta hai, phir OLD_BATCH (default 12) ek saath approve, live progress bar ke saath."""
     lang = await lang_of(notify)
     g = await gcfg()
     c = await ccfg(cid) or {}
     lo, hi = c.get("min", g["min"]), c.get("max", g["max"])
     done, fails = 0, Counter()
-    reported = 0
+    total, tick, t0, msg = 0, 0, time.time(), None
+    stop_kb = InlineKeyboardMarkup([[B(tx(lang, "b_oldstop"), callback_data=f"cz:{cid}")]])
+
+    def render(spin=None):
+        bad = sum(fails.values())
+        proc = done + bad
+        pct = (proc * 100 / total) if total else 0
+        rate = proc / max(time.time() - t0, 0.001)
+        eta = int((total - proc) / rate) if rate > 0 and proc < total else 0
+        return tx(lang, "old_pb", cid=cid, spin=spin or BAR_SPIN[tick % len(BAR_SPIN)], bar=pbar(pct, tick),
+                  pct=f"{pct:.0f}", done=done, total=total, bad=bad, rate=f"{rate:.0f}", eta=fmt_eta(eta))
+
+    async def ticker():
+        nonlocal tick
+        while True:
+            await asyncio.sleep(2)
+            tick += 1
+            if msg is None or not total:
+                continue
+            try:
+                await msg.edit_text(render(), reply_markup=stop_kb)
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+            except Exception:
+                pass
 
     async def one(u):
         nonlocal done
@@ -1016,29 +1194,28 @@ async def approve_old(cid: int, notify: int):
             fails[rid] += 1
             await record_fail(cid, u.id, u.first_name, u.username, rid, "old")
 
-    async def flush(buf):
-        nonlocal reported
-        await asyncio.gather(*(one(u) for u in buf))
-        if hi > 0:
-            await asyncio.sleep(random.uniform(lo, hi))
-        if done - reported >= 100:
-            reported = done
-            await bot.send_message(notify, tx(lang, "old_prog", cid=cid, n=done))
-
+    ticker_task = asyncio.ensure_future(ticker())
     try:
         if old_sem.locked():
             await bot.send_message(notify, tx(lang, "old_queue"))
         async with old_sem:
             if not await ensure_peer(cid):
                 raise RuntimeError("Helper account is not a member of this chat")
-            buf = []
-            async for req in user.get_chat_join_requests(cid):
-                buf.append(req.user)
-                if len(buf) >= OLD_BATCH:
-                    await flush(buf)
-                    buf = []
-            if buf:
-                await flush(buf)
+            msg = await bot.send_message(notify, tx(lang, "old_count"))
+            reqs = []
+            async for req in user.get_chat_join_requests(cid):         # pehle total ginti
+                reqs.append(req.user)
+            total = len(reqs)
+            if not total:
+                await msg.edit_text(tx(lang, "old_none"))
+                msg = None
+            else:
+                t0 = time.time()
+                await msg.edit_text(render(), reply_markup=stop_kb)
+                for i in range(0, total, OLD_BATCH):
+                    await asyncio.gather(*(one(u) for u in reqs[i:i + OLD_BATCH]))
+                    if hi > 0:
+                        await asyncio.sleep(random.uniform(lo, hi))
         left = await helper_leave(cid)
         text = tx(lang, "old_done", cid=cid, ok=done, bad=sum(fails.values()))
         if fails:
@@ -1053,6 +1230,12 @@ async def approve_old(cid: int, notify: int):
         left = await helper_leave(cid)
         await bot.send_message(notify, tx(lang, "old_err", cid=cid, e=f"{type(e).__name__}: {e}") + (("\n\n" + tx(lang, "old_left")) if left else ""))
     finally:
+        ticker_task.cancel()
+        if msg is not None and total:                                  # bar ko aakhri halat me rok do
+            try:
+                await msg.edit_text(render("✅" if done + sum(fails.values()) >= total else "⏹"), reply_markup=None)
+            except Exception:
+                pass
         old_tasks.pop(cid, None)
 
 
@@ -1114,11 +1297,11 @@ async def main_panel(uid: int):
               [B(tx(lang, "b_chats"), callback_data="chats"), B(tx(lang, "b_users"), callback_data="us:0")],
               [B(tx(lang, "b_sess"), callback_data="ses")],
               [B(tx(lang, "b_mode", m=tx(lang, "mode_pub" if pub else "mode_priv")), callback_data="pub")],
-              [B(tx(lang, "lang_btn"), callback_data="lang")]]
+              lang_row(lang)]
         if not IS_CLONE:
             kb.append([B(tx(lang, "myclone_btn"), callback_data="k"), B(tx(lang, "b_clones_admin"), callback_data="ka:0")])
         kb.append([B(tx(lang, "b_report", s=tick(rep_on)), callback_data="rep")])
-        kb.append([B(tx(lang, "refresh"), callback_data="main")])
+        kb.append([B(tx(lang, "help_btn"), callback_data="hp"), B(tx(lang, "refresh"), callback_data="main")])
     else:
         n, tot = 0, 0
         async for c in db.chats.find({"owner_id": uid}):
@@ -1126,12 +1309,18 @@ async def main_panel(uid: int):
             tot += c.get("approved", 0)
         text = clone_head(lang) + tx(lang, "user_main", n=n, tot=tot)
         kb = [[B(tx(lang, "my_chats"), callback_data="chats"), B(tx(lang, "add_chat"), callback_data="add")],
-              [B(tx(lang, "old_help_btn"), callback_data="oh")]]
+              [B(tx(lang, "help_btn"), callback_data="hp")]]
         if not IS_CLONE:
             kb.append([B(tx(lang, "myclone_btn"), callback_data="k")])
         kb.append([B(tx(lang, "b_report", s=tick(rep_on)), callback_data="rep")])
-        kb.append([B(tx(lang, "lang_btn"), callback_data="lang"), B(tx(lang, "refresh"), callback_data="main")])
+        kb.append(lang_row(lang))
+        kb.append([B(tx(lang, "refresh"), callback_data="main")])
     return text, InlineKeyboardMarkup(kb)
+
+async def help_panel(uid: int):
+    lang = await lang_of(uid)
+    text = tx(lang, "help_user") + (tx(lang, "help_admin") if uid in OWNERS else "")
+    return text, InlineKeyboardMarkup([[B(tx(lang, "back"), callback_data="main")]])
 
 async def chats_panel(uid: int, page=0):
     lang = await lang_of(uid)
@@ -1593,7 +1782,7 @@ async def on_member(_, u):
 # ======================= callbacks =======================
 OWNER_ACTS = {"us", "g", "ses", "lg", "ls", "lo", "delay", "dp", "dc", "wt", "pub", "ka", "kv", "kt", "kz", "kzy", "kon"}
 MAIN_ONLY = {"k", "kn", "kr", "kd", "kdy", "ka", "kv", "kt", "kz", "kzy", "kon"}
-CHAT_ACTS = {"c", "ct", "cr", "cd", "cq", "cdp", "ah", "co", "cs", "cx", "cw", "ce", "fr", "fc", "fq"}
+CHAT_ACTS = {"c", "ct", "cr", "cd", "cq", "cdp", "ah", "co", "cs", "cz", "cx", "cw", "ce", "fr", "fc", "fq"}
 
 @on_callback(is_user)
 @safe
@@ -1617,8 +1806,10 @@ async def cb(_, q: CallbackQuery):
         if act == "main":
             await cancel_login(uid)
             return await show(q, *await main_panel(uid))
+        if act == "hp":
+            return await show(q, *await help_panel(uid))
         if act == "lang":
-            await set_lang(uid, "en" if lang == "hi" else "hi")
+            await set_lang(uid, arg if arg in ("hi", "en") else ("en" if lang == "hi" else "hi"))
             return await show(q, *await main_panel(uid))
         if act == "rep":
             cur = ((await db.users.find_one({"_id": uid})) or {}).get("report", True)
@@ -1754,6 +1945,11 @@ async def cb(_, q: CallbackQuery):
             old_tasks[cid] = asyncio.create_task(approve_old(cid, uid))
             await q.answer(tx(lang, "q_started"))
             return await show(q, *await chat_panel(cid, uid))
+        if act == "cz":                     # progress bar ka ⏹ : sirf rokta hai, bar wahin rehta hai
+            t = old_tasks.get(int(arg))
+            if t:
+                t.cancel()
+            return await q.answer(tx(lang, "q_stopping"))
         if act == "cs":
             t = old_tasks.get(int(arg))
             if t:
@@ -1990,11 +2186,16 @@ async def main():
     await boot_clones()
     status = await mongo_status()
     log.info("Bot started | %s | owners=%s | public=%s | clones=%s", status, sorted(MAIN.owners), MAIN.state["public"], len(RUNNING))
+    g = await gcfg()
     for oid in MAIN.owners:
         try:
+            l = await lang_of(oid)
+            hs = ("✅ " + clean(helper["name"])) if helper else tx(l, "hs_none")
             await MAIN.client.send_message(
-                oid, f"🚀 Bot started\n{status}\nMode: {'🌐 Public' if MAIN.state['public'] else '🔒 Private'}"
-                     f"\nHelper: {'✅' if MAIN.user else '❌'} | Clones: {len(RUNNING)}")
+                oid, tx(l, "restart_msg", ver=VERSION, mode=tx(l, "mode_pub" if MAIN.state["public"] else "mode_priv"),
+                        hs=hs, db=status, clones=len(RUNNING), dly=dly(g["min"], g["max"], l),
+                        t=datetime.utcnow().strftime("%d %b %Y, %H:%M")),
+                reply_markup=InlineKeyboardMarkup([[B(tx(l, "open_panel"), callback_data="main")]]))
         except Exception as e:
             log.warning("owner %s ko msg nahi gaya: %s", oid, e)
     await asyncio.Event().wait()
