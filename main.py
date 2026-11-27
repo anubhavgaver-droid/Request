@@ -45,12 +45,13 @@ TG_WORKERS = int(os.environ.get("TG_WORKERS", 32))       # Pyrogram ke update ha
 # ---- button colours: Telegram ka native style (primary=blue, success=green, danger=red)
 # Library 'style' support karti ho to native rang; warna rang wale dot (🟢 🔵 🔴) fallback.
 import inspect
+from pyrogram import enums as _enums
 def _detect_native() -> bool:
     mode = os.environ.get("BUTTON_STYLE", "auto").lower()
     if mode in ("emoji", "native"):
         return mode == "native"
-    try:
-        return "style" in inspect.signature(_IB.__init__).parameters
+    try:      # kurigram: InlineKeyboardButton(..., style=enums.ButtonStyle.PRIMARY)
+        return hasattr(_enums, "ButtonStyle") and "style" in inspect.signature(_IB.__init__).parameters
     except Exception:
         return False
 NATIVE_STYLE = _detect_native()
@@ -78,7 +79,7 @@ def B(text, callback_data=None, **kw):
     else:
         style, label = ("danger" if act in _DANGER else "primary"), _plain(text)
     if NATIVE_STYLE:
-        return _IB(label, callback_data=callback_data, style=style, **kw)
+        return _IB(label, callback_data=callback_data, style=getattr(_enums.ButtonStyle, style.upper()), **kw)
     return _IB(f"{_DOT[style]} {label}", callback_data=callback_data, **kw)
 
 def lang_row(lang: str):
