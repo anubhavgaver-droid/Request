@@ -42,9 +42,23 @@ VERSION = "3.0"
 OLD_BATCH = int(os.environ.get("OLD_BATCH", 12))         # purani requests: ek saath kitni approve (10-12)
 TG_WORKERS = int(os.environ.get("TG_WORKERS", 32))       # Pyrogram ke update handlers (parallel)
 
-# ---- simple buttons: plain text + colour dot  (🟢 on/selected · 🔵 action · 🔴 danger)
+# ---- button colours: Telegram ka native style (primary=blue, success=green, danger=red)
+# Library 'style' support karti ho to native rang; warna rang wale dot (🟢 🔵 🔴) fallback.
+import inspect
+def _detect_native() -> bool:
+    mode = os.environ.get("BUTTON_STYLE", "auto").lower()
+    if mode in ("emoji", "native"):
+        return mode == "native"
+    try:
+        return "style" in inspect.signature(_IB.__init__).parameters
+    except Exception:
+        return False
+NATIVE_STYLE = _detect_native()
+
 _DANGER = {"cx", "cs", "cz", "kd", "kdy", "kz", "kzy", "lo", "fc"}
 _NOPAINT = {"p", "us", "ka", "noop"}                 # page arrows / page counter
+_BY_DOT = {"🟢": "success", "🔵": "primary", "🔴": "danger"}
+_DOT = {v: k for k, v in _BY_DOT.items()}
 
 def _plain(t: str) -> str:
     i = 0
@@ -53,15 +67,19 @@ def _plain(t: str) -> str:
     return t[i:] or t
 
 def B(text, callback_data=None, **kw):
-    if callback_data is not None:
-        act = callback_data.split(":", 1)[0]
-        if text[:1] in ("🟢", "🔵", "🔴", "‹", "↻") or act in _NOPAINT:
-            pass
-        elif "🟢" in text or "🔴" in text:                      # toggle: colour already in the ON/OFF text
-            text = _plain(text)
-        else:
-            text = ("🔴 " if act in _DANGER else "🔵 ") + _plain(text)
-    return _IB(text, callback_data=callback_data, **kw)
+    if callback_data is None or text[:1] in ("‹", "↻") or callback_data.split(":", 1)[0] in _NOPAINT:
+        return _IB(text, callback_data=callback_data, **kw)
+    act = callback_data.split(":", 1)[0]
+    if text[:1] in _BY_DOT:                                   # explicit colour (language buttons)
+        style, label = _BY_DOT[text[0]], text[1:].strip()
+    elif "🟢" in text or "🔴" in text:                        # ON/OFF toggle: colour follows the state
+        style = "success" if "🟢" in text else "danger"
+        label = re.sub(r"\s+", " ", text.replace("🟢", "").replace("🔴", "")).strip()
+    else:
+        style, label = ("danger" if act in _DANGER else "primary"), _plain(text)
+    if NATIVE_STYLE:
+        return _IB(label, callback_data=callback_data, style=style, **kw)
+    return _IB(f"{_DOT[style]} {label}", callback_data=callback_data, **kw)
 
 def lang_row(lang: str):
     return [B("🟢 ✔ हिंदी" if lang == "hi" else "🔵 हिंदी", callback_data="lang:hi"),
@@ -638,7 +656,7 @@ TX["hi"].update({
                "• **मोड** – Public (सब) / Private (सिर्फ admin)\n"
                "• **यूज़र्स / क्लोन बॉट** – यूज़र और क्लोन मैनेज",
  "restart_msg": "🟢 **बॉट रीस्टार्ट हो गया**\n━━━━━━━━━━━━\nवर्ज़न › `v{ver}`\nस्टेटस › 🟢 Online\nमोड › {mode}\n"
-                "स्पीड › {dly}\nHelper › {hs}\nडेटाबेस › {db}\nक्लोन › {clones}\nसमय › {t} UTC",
+                "स्पीड › {dly}\nHelper › {hs}\nडेटाबेस › {db}\nबटन रंग › {btn}\nक्लोन › {clones}\nसमय › {t} UTC",
 })
 TX["en"].update({
  "back": "‹ Back", "refresh": "↻ Refresh", "help_btn": "Help", "open_panel": "Open panel",
@@ -691,7 +709,7 @@ TX["en"].update({
                "• **Users / Clone bot** – manage users and clones",
  "restart_msg": "🟢 **" + sc("bot restarted") + "**\n━━━━━━━━━━━━\n" + sc("version") + " › `v{ver}`\n"
                 + sc("status") + " › 🟢 Online\n" + sc("mode") + " › {mode}\n" + sc("speed") + " › {dly}\n"
-                + sc("helper") + " › {hs}\n" + sc("database") + " › {db}\n" + sc("clones") + " › {clones}\n"
+                + sc("helper") + " › {hs}\n" + sc("database") + " › {db}\n" + sc("button colors") + " › {btn}\n" + sc("clones") + " › {clones}\n"
                 + sc("time") + " › {t} UTC",
 })
 REASON_EMOJI = {"USER_CHANNELS_TOO_MUCH": "🚫", "USER_DEACTIVATED": "👻", "USER_DEACTIVATED_BAN": "⛔",
@@ -2185,6 +2203,7 @@ async def main():
     asyncio.create_task(self_ping())
     await boot_clones()
     status = await mongo_status()
+    log.info("Button style: %s", "native" if NATIVE_STYLE else "emoji fallback")
     log.info("Bot started | %s | owners=%s | public=%s | clones=%s", status, sorted(MAIN.owners), MAIN.state["public"], len(RUNNING))
     g = await gcfg()
     for oid in MAIN.owners:
@@ -2193,7 +2212,8 @@ async def main():
             hs = ("✅ " + clean(helper["name"])) if helper else tx(l, "hs_none")
             await MAIN.client.send_message(
                 oid, tx(l, "restart_msg", ver=VERSION, mode=tx(l, "mode_pub" if MAIN.state["public"] else "mode_priv"),
-                        hs=hs, db=status, clones=len(RUNNING), dly=dly(g["min"], g["max"], l),
+                        hs=hs, db=status, clones=len(RUNNING),
+                        btn="native" if NATIVE_STYLE else "emoji fallback", dly=dly(g["min"], g["max"], l),
                         t=datetime.utcnow().strftime("%d %b %Y, %H:%M")),
                 reply_markup=InlineKeyboardMarkup([[B(tx(l, "open_panel"), callback_data="main")]]))
         except Exception as e:
