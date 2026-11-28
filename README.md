@@ -57,3 +57,8 @@ Agar "Add New Admins" permission nahi hai to bot saaf bata deta hai ki kya karna
   `Open channel | https://t.me/example`
   `Rules | https://example.com && Support | @support`
 - Text me `{name}` (member ka naam) aur `{chat}` (chat ka naam) chalta hai.
+
+## 🎞 Start sticker
+- `/start` dabate hi pehle ek sticker aata hai (2 / 3 / 5 second), phir apne-aap delete hokar asli panel dikhta hai.
+- Sirf **owner** badal sakta hai: Admin home → **Start sticker** → sticker seedha bhejo **ya** sticker ki ID (file_id) paste karo.
+- ON/OFF, Preview, time (2s/3s/5s) aur Remove usi panel me. Code alag file: `sticker.py`.

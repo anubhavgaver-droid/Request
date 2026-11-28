@@ -10,6 +10,7 @@ asyncio.set_event_loop(loop)  # Pyrogram/Motor isi loop par bandhenge
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 import welcome as W          # welcome DM: text + photo + buttons (alag file)
+import sticker as S          # /start par pehle sticker (alag file)
 from pyrogram.errors import (FloodWait, RPCError, MessageNotModified, SessionPasswordNeeded,
                              PhoneCodeInvalid, PhoneCodeExpired)
 from pyrogram.handlers import (MessageHandler, CallbackQueryHandler, ChatJoinRequestHandler,
@@ -57,7 +58,7 @@ def _detect_native() -> bool:
         return False
 NATIVE_STYLE = _detect_native()
 
-_DANGER = {"cx", "cs", "cz", "kd", "kdy", "kz", "kzy", "lo", "fc", "wpx", "wpc"}
+_DANGER = {"cx", "cs", "cz", "kd", "kdy", "kz", "kzy", "lo", "fc", "wpx", "wpc", "skx"}
 _NOPAINT = {"p", "us", "ka", "noop"}                 # page arrows / page counter
 _BY_DOT = {"🟢": "success", "🔵": "primary", "🔴": "danger"}
 _DOT = {v: k for k, v in _BY_DOT.items()}
@@ -206,7 +207,8 @@ def dec(s):
     return s
 
 
-DEFAULTS = {"active": True, "auto_all": True, "min": 0, "max": 0, "welcome_on": False, "welcome_photo": None, "welcome_buttons": [], "public": False,
+DEFAULTS = {"active": True, "auto_all": True, "min": 0, "max": 0, "welcome_on": False, "welcome_photo": None, "welcome_buttons": [], "start_sticker": None, "start_sticker_on": True,
+            "start_sticker_secs": 3, "public": False,
             "clone_on": True, "welcome": "Hello {name}! {chat} me aapki request approve ho gayi hai."}
 tick = lambda b: "🟢 ON" if b else "🔴 OFF"
 clean = lambda t: re.sub(r"[\[\]*_`~|]", "", str(t))
@@ -656,6 +658,7 @@ TX["hi"].update({
                "• **वेलकम (सभी)** – सभी चैट का डिफ़ॉल्ट वेलकम\n"
                "• **Helper login** – helper अकाउंट लॉगिन\n"
                "• **मोड** – Public (सब) / Private (सिर्फ admin)\n"
+               "• **स्टार्ट स्टिकर** – /start पर पहले दिखने वाला स्टिकर\n"
                "• **यूज़र्स / क्लोन बॉट** – यूज़र और क्लोन मैनेज",
  "restart_msg": "🟢 **बॉट रीस्टार्ट हो गया**\n━━━━━━━━━━━━\nवर्ज़न › `v{ver}`\nस्टेटस › 🟢 Online\nमोड › {mode}\n"
                 "स्पीड › {dly}\nHelper › {hs}\nडेटाबेस › {db}\nबटन रंग › {btn}\nक्लोन › {clones}\nसमय › {t} UTC",
@@ -708,6 +711,7 @@ TX["en"].update({
                "• **Welcome (all)** – default welcome for all chats\n"
                "• **Helper login** – log in the helper account\n"
                "• **Mode** – Public (everyone) / Private (admins only)\n"
+               "• **Start sticker** – sticker shown first on /start\n"
                "• **Users / Clone bot** – manage users and clones",
  "restart_msg": "🟢 **" + sc("bot restarted") + "**\n━━━━━━━━━━━━\n" + sc("version") + " › `v{ver}`\n"
                 + sc("status") + " › 🟢 Online\n" + sc("mode") + " › {mode}\n" + sc("speed") + " › {dly}\n"
@@ -1334,6 +1338,7 @@ async def main_panel(uid: int):
               [B(tx(lang, "b_chats"), callback_data="chats"), B(tx(lang, "b_users"), callback_data="us:0")],
               [B(tx(lang, "b_sess"), callback_data="ses")],
               [B(tx(lang, "b_mode", m=tx(lang, "mode_pub" if pub else "mode_priv")), callback_data="pub")],
+              [B(S.ts(lang, "b_home"), callback_data="sk")],
               lang_row(lang)]
         if not IS_CLONE:
             kb.append([B(tx(lang, "myclone_btn"), callback_data="k"), B(tx(lang, "b_clones_admin"), callback_data="ka:0")])
@@ -1353,6 +1358,39 @@ async def main_panel(uid: int):
         kb.append(lang_row(lang))
         kb.append([B(tx(lang, "refresh"), callback_data="main")])
     return text, InlineKeyboardMarkup(kb)
+
+async def sticker_panel(uid: int):
+    lang = await lang_of(uid)
+    return S.panel(lang, await gcfg(), B)
+
+async def _del_later(msg, secs: float):
+    await asyncio.sleep(secs)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+STICKER_ACTS = {"sk", "sko", "skt", "skv", "sks", "skx"}
+
+async def sticker_action(q, act: str, arg: str, uid: int, lang: str):
+    g = await gcfg()
+    if act == "sko":
+        await gset(start_sticker_on=not g.get("start_sticker_on", True))
+    elif act == "sks":
+        if arg.isdigit() and int(arg) in S.SECS_CHOICES:
+            await gset(start_sticker_secs=int(arg))
+    elif act == "skx":
+        await gset(start_sticker=None)
+        await q.answer(S.ts(lang, "removed"))
+    elif act == "skt":
+        pending[uid] = ("sticker",)
+        return await q.message.reply(S.ts(lang, "prompt"))
+    elif act == "skv":
+        if not g.get("start_sticker"):
+            return await q.answer(S.ts(lang, "e_nosticker"), show_alert=True)
+        await q.answer()
+        return await S.flash(q.message.reply_sticker, g["start_sticker"], float(g.get("start_sticker_secs") or S.DEFAULT_SECS))
+    return await show(q, *await sticker_panel(uid))
 
 async def welcome_data(scope: str):
     g = await gcfg()
@@ -1763,6 +1801,10 @@ async def start(_, m: Message):
     if uid not in OWNERS and not STATE["public"]:
         return await m.reply(clone_head(lang) + tx(lang, "private_bot", uid=uid))
     await cancel_login(uid)
+    if m.command and m.command[0] == "start":              # sirf /start par: sticker 2-5s, phir delete
+        g = await gcfg()
+        if g.get("start_sticker") and g.get("start_sticker_on", True):
+            await S.flash(m.reply_sticker, g["start_sticker"], float(g.get("start_sticker_secs") or S.DEFAULT_SECS))
     await show(m, *await main_panel(uid))
 
 @on_message(filters.command("id") & filters.private)
@@ -1870,7 +1912,7 @@ async def on_member(_, u):
 
 
 # ======================= callbacks =======================
-OWNER_ACTS = {"us", "g", "ses", "lg", "ls", "lo", "delay", "dp", "dc", "wt", "pub", "ka", "kv", "kt", "kz", "kzy", "kon"}
+OWNER_ACTS = {"sk", "sko", "skt", "skv", "sks", "skx", "us", "g", "ses", "lg", "ls", "lo", "delay", "dp", "dc", "wt", "pub", "ka", "kv", "kt", "kz", "kzy", "kon"}
 MAIN_ONLY = {"k", "kn", "kr", "kd", "kdy", "ka", "kv", "kt", "kz", "kzy", "kon"}
 CHAT_ACTS = {"c", "ct", "cr", "cd", "cq", "cdp", "ah", "co", "cs", "cz", "cx", "cw", "ce", "fr", "fc", "fq"}
 
@@ -1889,6 +1931,8 @@ async def cb(_, q: CallbackQuery):
         if act in CHAT_ACTS and not await can_manage(uid, int(arg.split(":")[0])):
             return await q.answer(tx(lang, "q_no_access"), show_alert=True)
 
+        if act in STICKER_ACTS:
+            return await sticker_action(q, act, arg, uid, lang)
         if act in WELCOME_ACTS:
             if arg == "g" and uid not in OWNERS:
                 return await q.answer(tx(lang, "q_owner_only"), show_alert=True)
@@ -2105,7 +2149,7 @@ async def cb(_, q: CallbackQuery):
 
 
 # ======================= text input (button ke baad) =======================
-OWNER_KINDS = {"lphone", "lcode", "lpass", "lstr", "delay", "welcome"}
+OWNER_KINDS = {"sticker", "lphone", "lcode", "lpass", "lstr", "delay", "welcome"}
 
 def check_template(text: str, lang: str = "hi"):
     try:
@@ -2198,6 +2242,19 @@ async def on_input(_, m: Message):
             await db.chats.update_one({"_id": st[1]}, {"$set": {"min": lo, "max": hi}}, upsert=True)
             pending.pop(uid, None)
             return await show(m, *await chat_panel(st[1], uid))
+        if kind == "sticker":
+            fid = m.sticker.file_id if m.sticker else (m.text or "").strip()
+            if not fid:
+                raise UserError(S.ts(lang, "e_none"))
+            try:
+                test = await m.reply_sticker(fid)                 # chal rahi hai ya nahi: bhej kar check
+            except Exception:
+                raise UserError(S.ts(lang, "e_bad"))
+            bg(_del_later(test, 2))
+            await gset(start_sticker=fid)
+            pending.pop(uid, None)
+            await m.reply(S.ts(lang, "saved"))
+            return await show(m, *await sticker_panel(uid))
         if kind in ("wtext", "wphoto", "wbtn"):
             scope = st[1]
             if scope == "g" and uid not in OWNERS:
