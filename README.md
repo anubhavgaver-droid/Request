@@ -49,3 +49,11 @@ Bot ko chat me admin banao (**Invite Users + Add New Admins** permission ke saat
 Ye apne-aap hota hai: (a) bot ko admin banate hi, (b) jab 🕰 purani requests dabate ho aur helper admin nahi hai,
 (c) chat panel ke **🤝 Helper को Admin बनाओ (Auto)** button se. Bot sirf helper account ko hi promote karta hai.
 Agar "Add New Admins" permission nahi hai to bot saaf bata deta hai ki kya karna hai.
+
+## 👋 Welcome DM (text + photo + buttons)
+- Code alag file me hai: **`welcome.py`** (main.py ke saath ek hi folder me rakho).
+- Chat panel / Admin home → **Welcome settings**: ON/OFF, Preview, Edit text, Photo, Buttons.
+- Buttons ka format (har line me ek, ek line me 2 ho to `&&`):
+  `Open channel | https://t.me/example`
+  `Rules | https://example.com && Support | @support`
+- Text me `{name}` (member ka naam) aur `{chat}` (chat ka naam) chalta hai.

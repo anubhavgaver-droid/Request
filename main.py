@@ -9,6 +9,7 @@ asyncio.set_event_loop(loop)  # Pyrogram/Motor isi loop par bandhenge
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
+import welcome as W          # welcome DM: text + photo + buttons (alag file)
 from pyrogram.errors import (FloodWait, RPCError, MessageNotModified, SessionPasswordNeeded,
                              PhoneCodeInvalid, PhoneCodeExpired)
 from pyrogram.handlers import (MessageHandler, CallbackQueryHandler, ChatJoinRequestHandler,
@@ -56,7 +57,7 @@ def _detect_native() -> bool:
         return False
 NATIVE_STYLE = _detect_native()
 
-_DANGER = {"cx", "cs", "cz", "kd", "kdy", "kz", "kzy", "lo", "fc"}
+_DANGER = {"cx", "cs", "cz", "kd", "kdy", "kz", "kzy", "lo", "fc", "wpx", "wpc"}
 _NOPAINT = {"p", "us", "ka", "noop"}                 # page arrows / page counter
 _BY_DOT = {"🟢": "success", "🔵": "primary", "🔴": "danger"}
 _DOT = {v: k for k, v in _BY_DOT.items()}
@@ -205,7 +206,7 @@ def dec(s):
     return s
 
 
-DEFAULTS = {"active": True, "auto_all": True, "min": 0, "max": 0, "welcome_on": False, "public": False,
+DEFAULTS = {"active": True, "auto_all": True, "min": 0, "max": 0, "welcome_on": False, "welcome_photo": None, "welcome_buttons": [], "public": False,
             "clone_on": True, "welcome": "Hello {name}! {chat} me aapki request approve ho gayi hai."}
 tick = lambda b: "🟢 ON" if b else "🔴 OFF"
 clean = lambda t: re.sub(r"[\[\]*_`~|]", "", str(t))
@@ -616,10 +617,10 @@ TX["hi"].update({
  "mode_pub": "Public", "mode_priv": "Private", "hs_none": "❌ जुड़ा नहीं",
  "my_chats": "मेरे चैट", "add_chat": "चैट जोड़ो", "myclone_btn": "क्लोन बॉट", "b_clones_admin": "क्लोन (Admin)",
  "b_active": "बॉट: {s}", "b_autoall": "सभी चैट Auto-approve: {s}", "b_wg": "वेलकम (सभी): {s}",
- "b_chats": "सभी चैट", "b_gdelay": "स्पीड", "b_gwtext": "वेलकम टेक्स्ट", "b_sess": "Helper login",
+ "b_chats": "सभी चैट", "b_gdelay": "स्पीड", "b_gwtext": "वेलकम सेटिंग", "b_sess": "Helper login",
  "b_mode": "मोड: {m}", "b_users": "यूज़र्स", "b_report": "डेली रिपोर्ट: {s}",
  "b_approve": "Approve: {s}", "b_cdelay": "स्पीड", "b_reset": "रीसेट", "b_wdm": "वेलकम DM: {s}",
- "b_wtext": "वेलकम टेक्स्ट", "b_old": "पुरानी रिक्वेस्ट Approve", "b_oldstop": "रोको",
+ "b_wtext": "वेलकम सेटिंग", "b_old": "पुरानी रिक्वेस्ट Approve", "b_oldstop": "रोको",
  "b_fail": "Failed रिपोर्ट", "b_help": "Helper जानकारी", "b_rm": "चैट हटाओ", "b_ah": "Helper जोड़ो",
  "b_custom": "कस्टम", "d_instant": "तुरंत (0s)",
  "dly_instant": "⚡ तुरंत", "dly_range": "{lo}-{hi} सेकंड",
@@ -643,7 +644,7 @@ TX["hi"].update({
               "• **चैट जोड़ो** – ID / @username से चैट जोड़ो\n"
               "• **Approve** – auto-approve चालू/बंद\n"
               "• **स्पीड** – approve से पहले की देरी (तुरंत = बिना रुके)\n"
-              "• **वेलकम DM** – नए मेंबर को जाने वाला मैसेज\n"
+              "• **वेलकम सेटिंग** – नए मेंबर को जाने वाला DM (टेक्स्ट + फोटो + बटन)\n"
               "• **पुरानी रिक्वेस्ट Approve** – सारी pending रिक्वेस्ट approve\n"
               "• **Helper जोड़ो** – helper अकाउंट को admin बनाता है (अपने-आप भी होता है)\n"
               "• **Failed रिपोर्ट** – जो रिक्वेस्ट approve नहीं हुईं\n"
@@ -664,10 +665,10 @@ TX["en"].update({
  "mode_pub": "Public", "mode_priv": "Private", "hs_none": "❌ Not connected",
  "my_chats": "My chats", "add_chat": "Add chat", "myclone_btn": "Clone bot", "b_clones_admin": "Clones (Admin)",
  "b_active": "Bot: {s}", "b_autoall": "Auto-approve all chats: {s}", "b_wg": "Welcome (all): {s}",
- "b_chats": "All chats", "b_gdelay": "Speed", "b_gwtext": "Welcome text", "b_sess": "Helper login",
+ "b_chats": "All chats", "b_gdelay": "Speed", "b_gwtext": "Welcome settings", "b_sess": "Helper login",
  "b_mode": "Mode: {m}", "b_users": "Users", "b_report": "Daily report: {s}",
  "b_approve": "Approve: {s}", "b_cdelay": "Speed", "b_reset": "Reset", "b_wdm": "Welcome DM: {s}",
- "b_wtext": "Welcome text", "b_old": "Approve old requests", "b_oldstop": "Stop",
+ "b_wtext": "Welcome settings", "b_old": "Approve old requests", "b_oldstop": "Stop",
  "b_fail": "Failed report", "b_help": "Helper info", "b_rm": "Remove chat", "b_ah": "Add helper",
  "b_custom": "Custom", "d_instant": "Instant (0s)",
  "dly_instant": "⚡ Instant", "dly_range": "{lo}-{hi} sec",
@@ -695,7 +696,7 @@ TX["en"].update({
               "• **Add chat** – add a chat by ID / @username\n"
               "• **Approve** – auto-approve on / off\n"
               "• **Speed** – wait before approving (Instant = no wait)\n"
-              "• **Welcome DM** – message sent to the new member\n"
+              "• **Welcome settings** – DM sent to the new member (text + photo + buttons)\n"
               "• **Approve old requests** – approves every pending request\n"
               "• **Add helper** – makes the helper account admin (also automatic)\n"
               "• **Failed report** – requests that could not be approved\n"
@@ -840,6 +841,17 @@ def welcome_of(c: dict, g: dict):
         return False, g["welcome"]
     return g["welcome_on"], g["welcome"]
 
+def welcome_cfg(c: dict, g: dict) -> dict:
+    """Welcome ki poori setting: on, text, photo, buttons (per-chat ya global)."""
+    oid = c.get("owner_id")
+    if "welcome_on" in c:
+        src, on, text = c, c["welcome_on"], c.get("welcome") or g["welcome"]
+    elif oid is not None and oid not in OWNERS:
+        return {"on": False, "text": g["welcome"], "photo": None, "buttons": []}
+    else:
+        src, on, text = g, g["welcome_on"], g["welcome"]
+    return {"on": on, "text": text, "photo": src.get("welcome_photo"), "buttons": src.get("welcome_buttons") or []}
+
 async def effective(cid: int):
     """Chat ki effective setting (2 second cache: har request par DB nahi padhna)."""
     hit = cfg_cache.get(cid)
@@ -861,9 +873,10 @@ async def _effective(cid: int):
         c = {}
     if c.get("enabled", True) is False:
         return None
-    w_on, w_text = welcome_of(c, g)
+    w = welcome_cfg(c, g)
     return {"min": c.get("min", g["min"]), "max": c.get("max", g["max"]),
-            "welcome_on": w_on, "welcome": w_text}
+            "welcome_on": w["on"], "welcome": w["text"],
+            "welcome_photo": w["photo"], "welcome_buttons": w["buttons"]}
 
 async def can_manage(uid: int, cid: int) -> bool:
     if uid in OWNERS:
@@ -973,9 +986,14 @@ async def on_request(_, r: ChatJoinRequest):
         bg(_save_title(cid, r.chat.title))
     queue.put_nowait((cid, r.chat.title, r.from_user.id, r.from_user.first_name, r.from_user.username, cfg))
 
-async def send_welcome(uid, text, name, title):
+def _wcall(fn, *a, **k):
+    return tg_call(fn, *a, gate="mflood_until", **k)
+
+async def send_welcome(uid, cfg, name, title):
+    """Naye member ko welcome DM: text (+ photo) (+ buttons). Fail ho to chupchap chhod do."""
     try:
-        await tg_call(bot.send_message, uid, text.format(name=name, chat=title), gate="mflood_until")
+        await W.deliver(bot, uid, {"text": cfg["welcome"], "photo": cfg.get("welcome_photo"),
+                                   "buttons": cfg.get("welcome_buttons")}, name, title, _wcall)
     except Exception:
         pass
 
@@ -989,7 +1007,7 @@ async def worker():
             bump(cid)
             bg(clear_fail(cid, uid))
             if cfg["welcome_on"]:
-                bg(send_welcome(uid, cfg["welcome"], name, title))
+                bg(send_welcome(uid, cfg, name, title))
         except Exception as e:
             rid = reason_of(e)
             log.warning("approve fail %s/%s: %s", cid, uid, rid)
@@ -1312,7 +1330,7 @@ async def main_panel(uid: int):
         kb = [[B(tx(lang, "b_active", s=tick(g["active"])), callback_data="g:active")],
               [B(tx(lang, "b_autoall", s=tick(g["auto_all"])), callback_data="g:auto_all")],
               [B(tx(lang, "b_wg", s=tick(g["welcome_on"])), callback_data="g:welcome_on")],
-              [B(tx(lang, "b_gdelay"), callback_data="delay"), B(tx(lang, "b_gwtext"), callback_data="wt")],
+              [B(tx(lang, "b_gdelay"), callback_data="delay"), B(tx(lang, "b_gwtext"), callback_data="wp:g")],
               [B(tx(lang, "b_chats"), callback_data="chats"), B(tx(lang, "b_users"), callback_data="us:0")],
               [B(tx(lang, "b_sess"), callback_data="ses")],
               [B(tx(lang, "b_mode", m=tx(lang, "mode_pub" if pub else "mode_priv")), callback_data="pub")],
@@ -1335,6 +1353,59 @@ async def main_panel(uid: int):
         kb.append(lang_row(lang))
         kb.append([B(tx(lang, "refresh"), callback_data="main")])
     return text, InlineKeyboardMarkup(kb)
+
+async def welcome_data(scope: str):
+    g = await gcfg()
+    if scope == "g":
+        return "", {"on": g["welcome_on"], "text": g["welcome"], "photo": g.get("welcome_photo"),
+                    "buttons": g.get("welcome_buttons") or []}
+    c = await ccfg(int(scope)) or {}
+    return clean(c.get("title", scope)), welcome_cfg(c, g)
+
+async def welcome_panel(scope: str, uid: int):
+    lang = await lang_of(uid)
+    title, w = await welcome_data(scope)
+    return W.panel(lang, scope, title, w, B)
+
+async def welcome_save(scope: str, **fields):
+    """Welcome field save. Chat pehle global se inherit kar rahi ho to pehle uski copy chat me bana lete hain."""
+    if scope == "g":
+        await gset(**fields)
+        return
+    cid = int(scope)
+    c, g = await ccfg(cid) or {}, await gcfg()
+    base = {}
+    if "welcome_on" not in c:
+        w = welcome_cfg(c, g)
+        base = {"welcome_on": w["on"], "welcome": w["text"], "welcome_photo": w["photo"], "welcome_buttons": w["buttons"]}
+    await db.chats.update_one({"_id": cid}, {"$set": {**base, **fields}}, upsert=True)
+    cfg_cache.clear()
+
+WELCOME_ACTS = {"wp", "wpo", "wpv", "wpt", "wph", "wpb", "wpx", "wpc"}
+
+async def welcome_action(q, act: str, scope: str, uid: int, lang: str):
+    if act == "wp":
+        return await show(q, *await welcome_panel(scope, uid))
+    if act == "wpo":
+        _t, w = await welcome_data(scope)
+        await welcome_save(scope, welcome_on=not w["on"])
+        return await show(q, *await welcome_panel(scope, uid))
+    if act == "wpx":
+        await welcome_save(scope, welcome_photo=None)
+        return await show(q, *await welcome_panel(scope, uid))
+    if act == "wpc":
+        await welcome_save(scope, welcome_buttons=[])
+        return await show(q, *await welcome_panel(scope, uid))
+    if act == "wpv":
+        title, w = await welcome_data(scope)
+        try:
+            await W.deliver(bot, uid, w, q.from_user.first_name, title or "Chat", _wcall)
+            return await q.answer(W.tw(lang, "preview_ok"))
+        except Exception as e:
+            return await q.answer(W.tw(lang, "preview_fail", e=reason_of(e))[:190], show_alert=True)
+    kind, prompt = {"wpt": ("wtext", "p_text"), "wph": ("wphoto", "p_photo"), "wpb": ("wbtn", "p_btn")}[act]
+    pending[uid] = (kind, scope)
+    await q.message.reply(W.tw(lang, prompt, max=W.MAX_BUTTONS))
 
 async def help_panel(uid: int):
     lang = await lang_of(uid)
@@ -1374,7 +1445,7 @@ async def chat_panel(cid: int, uid: int):
         [B(tx(lang, "b_approve", s=tick(on)), callback_data=f"ct:{cid}")],
         [B(tx(lang, "b_cdelay"), callback_data=f"cq:{cid}"), B(tx(lang, "b_reset"), callback_data=f"cr:{cid}")],
         [B(tx(lang, "b_wdm", s=tick(w_on)), callback_data=f"cw:{cid}")],
-        [B(tx(lang, "b_wtext"), callback_data=f"ce:{cid}")],
+        [B(tx(lang, "b_wtext"), callback_data=f"wp:{cid}")],
         [B(tx(lang, "b_ah"), callback_data=f"ah:{cid}")],
         [B(tx(lang, "b_oldstop"), callback_data=f"cs:{cid}") if running
          else B(tx(lang, "b_old"), callback_data=f"co:{cid}")],
@@ -1818,6 +1889,12 @@ async def cb(_, q: CallbackQuery):
         if act in CHAT_ACTS and not await can_manage(uid, int(arg.split(":")[0])):
             return await q.answer(tx(lang, "q_no_access"), show_alert=True)
 
+        if act in WELCOME_ACTS:
+            if arg == "g" and uid not in OWNERS:
+                return await q.answer(tx(lang, "q_owner_only"), show_alert=True)
+            if arg != "g" and not await can_manage(uid, int(arg)):
+                return await q.answer(tx(lang, "q_no_access"), show_alert=True)
+            return await welcome_action(q, act, arg, uid, lang)
         if act == "noop":
             return
         if act == "us":
@@ -2121,6 +2198,25 @@ async def on_input(_, m: Message):
             await db.chats.update_one({"_id": st[1]}, {"$set": {"min": lo, "max": hi}}, upsert=True)
             pending.pop(uid, None)
             return await show(m, *await chat_panel(st[1], uid))
+        if kind in ("wtext", "wphoto", "wbtn"):
+            scope = st[1]
+            if scope == "g" and uid not in OWNERS:
+                pending.pop(uid, None)
+                return
+            try:
+                if kind == "wtext":
+                    await welcome_save(scope, welcome=W.check_text(m.text, lang), welcome_on=True)
+                elif kind == "wphoto":
+                    if not m.photo:
+                        raise W.WelcomeError(W.tw(lang, "e_photo"))
+                    await welcome_save(scope, welcome_photo=m.photo.file_id, welcome_on=True)
+                else:
+                    await welcome_save(scope, welcome_buttons=W.parse_buttons(m.text, lang))
+            except W.WelcomeError as e:
+                raise UserError(str(e))
+            pending.pop(uid, None)
+            await m.reply(W.tw(lang, "saved"))
+            return await show(m, *await welcome_panel(scope, uid))
         if kind == "welcome":
             check_template(m.text, lang)
             await gset(welcome=m.text, welcome_on=True)
